@@ -1,0 +1,345 @@
+package cloudstream.desktop.app.ui
+
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.border
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.composed
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import cloudstream.desktop.app.domain.MediaCard
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
+
+/** Tiny in-memory poster cache; images are fetched on IO and decoded with Skia. Failures are cached as null. */
+object ImageCache {
+    private val max = 300
+    private val map = object : LinkedHashMap<String, ImageBitmap?>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap?>?) = size > max
+    }
+    private val client by lazy {
+        HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).connectTimeout(Duration.ofSeconds(8)).build()
+    }
+
+    @Synchronized private fun cached(url: String): Pair<Boolean, ImageBitmap?> = if (map.containsKey(url)) true to map[url] else false to null
+    @Synchronized private fun put(url: String, v: ImageBitmap?) { map[url] = v }
+
+    /**
+     * Fetches, decodes and downscales to at most [maxPx] on the longest side, all on IO. (makeFromEncoded alone is a
+     * LAZY image: the full-size decode then happened on the render thread when it first scrolled into view, and the
+     * 2000x3000 original was resampled every frame - the scrolling stutter.)
+     */
+    suspend fun load(url: String, maxPx: Int = 600): ImageBitmap? {
+        val key = "$maxPx|$url"
+        val (hit, v) = cached(key)
+        if (hit) return v
+        val bmp = withContext(Dispatchers.IO) {
+            runCatching {
+                val req = HttpRequest.newBuilder(URI(url)).timeout(Duration.ofSeconds(15)).header("User-Agent", "Mozilla/5.0").build()
+                val bytes = client.send(req, HttpResponse.BodyHandlers.ofByteArray()).body()
+                decodeScaled(bytes, maxPx).toComposeImageBitmap()
+            }.getOrNull()
+        }
+        put(key, bmp)
+        return bmp
+    }
+
+    private fun decodeScaled(bytes: ByteArray, maxPx: Int): org.jetbrains.skia.Image {
+        val src = org.jetbrains.skia.Image.makeFromEncoded(bytes)
+        val scale = minOf(1f, maxPx.toFloat() / maxOf(src.width, src.height))
+        val w = maxOf(1, (src.width * scale).toInt()); val h = maxOf(1, (src.height * scale).toInt())
+        val surface = org.jetbrains.skia.Surface.makeRasterN32Premul(w, h)
+        surface.canvas.drawImageRect(
+            src, org.jetbrains.skia.Rect.makeWH(src.width.toFloat(), src.height.toFloat()), org.jetbrains.skia.Rect.makeWH(w.toFloat(), h.toFloat()),
+            org.jetbrains.skia.SamplingMode.MITCHELL, null, true,
+        )
+        return surface.makeImageSnapshot().also { surface.close(); src.close() }
+    }
+}
+
+@Composable
+fun RemoteImage(url: String?, modifier: Modifier = Modifier, placeholderText: String = "", contentScale: ContentScale = ContentScale.Crop, maxPx: Int = 600) {
+    var bmp by remember(url) { mutableStateOf<ImageBitmap?>(null) }
+    val fetchable = !url.isNullOrBlank() && url.startsWith("http")
+    var loading by remember(url) { mutableStateOf(fetchable) }
+    LaunchedEffect(url) { if (fetchable) { bmp = ImageCache.load(url!!, maxPx); loading = false } }
+    val b = bmp
+    if (b != null) {
+        Image(b, null, modifier, contentScale = contentScale)
+    } else if (loading) {
+        // Artwork on its way: shimmer like CloudStream's poster placeholders.
+        Box(modifier.background(Color(0xFF1A1A20)).shimmer()) { ShimmerBlock(Modifier.fillMaxSize(), alpha = 0.12f, corner = 0.dp) }
+    } else {
+        Box(
+            modifier.background(Brush.linearGradient(listOf(Color(0xFF2B2B33), Color(0xFF17171C), Color(0xFF231417)))),
+            contentAlignment = Alignment.TopStart,
+        ) {
+            // Faint monogram as "artwork"; the card's own scrim shows the readable title.
+            Text(placeholderText.take(1).uppercase(), Modifier.padding(10.dp), style = MaterialTheme.typography.displaySmall,
+                color = Color.White.copy(alpha = 0.12f), fontWeight = FontWeight.Black)
+        }
+    }
+}
+
+/**
+ * Artwork tile: zooms and lifts on hover, title on a bottom scrim (artwork often has no text), quality tag top-right.
+ * [progress] (0..1) draws a red watch-progress bar along the bottom (Continue watching).
+ */
+@Composable
+fun PosterCard(
+    card: MediaCard, onClick: () -> Unit, modifier: Modifier = Modifier, width: Dp = 150.dp, horizontal: Boolean = false,
+    progress: Float? = null, caption: String? = null,
+    /** Right-click menu entries (built when it opens, so they show the current state). */
+    menu: (() -> List<CardMenuItem>)? = null,
+) {
+    val src = remember { MutableInteractionSource() }
+    val hovered by src.collectIsHoveredAsState()
+    val scale by animateFloatAsState(if (hovered) 1.07f else 1f, tween(160))
+    val w = if (horizontal) width * 1.6f else width
+    val h = if (horizontal) width * 0.9f else width * 1.5f
+    var menuAt by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    var menuItems by remember { mutableStateOf(emptyList<CardMenuItem>()) }
+    Box(modifier.width(w)) {
+    Column(Modifier.width(w)) {
+        Box(
+            Modifier.width(w).height(h)
+                .then(if (menu == null) Modifier else Modifier.onSecondaryPress { at -> menuItems = menu(); menuAt = at })
+                .zIndex(if (hovered) 1f else 0f)
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .shadow(if (hovered) 18.dp else 0.dp, RoundedCornerShape(6.dp))
+                .clip(RoundedCornerShape(6.dp))
+                .border(if (hovered) 2.dp else 0.dp, if (hovered) Color.White.copy(alpha = 0.85f) else Color.Transparent, RoundedCornerShape(6.dp))
+                .hoverable(src).clickable(onClick = onClick),
+        ) {
+            RemoteImage(card.posterUrl, Modifier.fillMaxSize(), placeholderText = card.name)
+            Box(Modifier.fillMaxWidth().height(h * 0.45f).align(Alignment.BottomCenter)
+                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.88f)))))
+            Text(
+                card.name, Modifier.align(Alignment.BottomStart).padding(start = 8.dp, end = 8.dp, bottom = if (progress != null) 10.dp else 8.dp),
+                color = Color.White, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            // As CloudStream's cards: quality top-left, the score top-right ("★ 7.7").
+            card.quality?.let { q ->
+                Text(q, Modifier.align(Alignment.TopStart).padding(6.dp).background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(3.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
+                    color = Color.White, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+            }
+            card.score?.let { sc -> ScoreBadge(sc, Modifier.align(Alignment.TopEnd).padding(6.dp)) }
+            if (progress != null) {
+                Box(Modifier.fillMaxWidth().height(4.dp).align(Alignment.BottomCenter).background(Color.White.copy(alpha = 0.25f)))
+                Box(Modifier.fillMaxWidth(progress.coerceIn(0.02f, 1f)).height(4.dp).align(Alignment.BottomStart).background(Accent))
+            }
+        }
+        if (caption != null) Text(caption, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+    }
+    menuAt?.let { at -> CardMenu(true, at, menuItems) { menuAt = null } }
+    }
+}
+
+/** A title's score out of 10, IMDb-style yellow tag (CloudStream's rating badge on cards). */
+@Composable
+fun ScoreBadge(score: Double, modifier: Modifier = Modifier) {
+    Text(
+        "★ " + String.format(java.util.Locale.ROOT, "%.1f", score),
+        modifier.background(Color(0xFFF5C518), RoundedCornerShape(4.dp)).padding(horizontal = 5.dp, vertical = 1.dp),
+        color = Color(0xFF1A1A1A), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Black,
+    )
+}
+
+/** Right mouse button pressed on this element: [onPress] gets the pointer position (px, local). */
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+fun Modifier.onSecondaryPress(onPress: (androidx.compose.ui.geometry.Offset) -> Unit): Modifier =
+    this.onPointerEvent(androidx.compose.ui.input.pointer.PointerEventType.Press) { e ->
+        if (e.buttons.isSecondaryPressed) {
+            e.changes.firstOrNull()?.let { ch -> ch.consume(); onPress(ch.position) }
+        }
+    }
+
+/** CloudStream's shimmer colours (res/values: grayShimmer #DCDCDC, base alpha 0.2, highlight alpha 0.3, 2000 ms). */
+private val ShimmerGray = Color(0xFFDCDCDC)
+
+/**
+ * Facebook-style shimmer like CloudStream's ShimmerFrameLayout: one light band sweeps diagonally across everything
+ * drawn inside (the skeleton shapes act as the mask), so a whole page shimmers as one surface.
+ */
+fun Modifier.shimmer(durationMs: Int = 2000): Modifier = composed {
+    val t = androidx.compose.animation.core.rememberInfiniteTransition()
+    val p by t.animateFloat(0f, 1f, androidx.compose.animation.core.infiniteRepeatable(tween(durationMs, easing = androidx.compose.animation.core.LinearEasing)))
+    graphicsLayer(compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen).drawWithContent {
+        drawContent()
+        val band = size.width * 0.3f
+        val x = -band + (size.width + 2 * band) * p
+        drawRect(
+            Brush.linearGradient(
+                listOf(Color.Transparent, ShimmerGray.copy(alpha = 0.3f), Color.Transparent),
+                start = androidx.compose.ui.geometry.Offset(x - band, 0f), end = androidx.compose.ui.geometry.Offset(x + band, band * 0.5f),
+            ),
+            blendMode = androidx.compose.ui.graphics.BlendMode.SrcAtop,
+        )
+    }
+}
+
+/** One skeleton shape (base colour); put a [shimmer] on a parent to animate a whole group. */
+@Composable
+fun ShimmerBlock(modifier: Modifier, alpha: Float = 0.2f, corner: Dp = 6.dp) =
+    Box(modifier.clip(RoundedCornerShape(corner)).background(ShimmerGray.copy(alpha = alpha)))
+
+/** Grey placeholder tile while a row loads (instead of a spinner). */
+@Composable
+fun SkeletonCard(width: Dp = 150.dp, horizontal: Boolean = false) =
+    ShimmerBlock(Modifier.width(if (horizontal) width * 1.6f else width).height(if (horizontal) width * 0.9f else width * 1.5f))
+
+@Composable
+fun SkeletonRow(count: Int = 8, width: Dp = 150.dp, horizontal: Boolean = false) {
+    Row(Modifier.shimmer(), horizontalArrangement = Arrangement.spacedBy(10.dp)) { repeat(count) { SkeletonCard(width, horizontal) } }
+}
+
+/**
+ * CloudStream's home loading screen (fragment_home.xml `home_loading_shimmer`): a 500 dp featured block, then three
+ * "loading_list" rows (short title line + a row of posters), all under one shimmer.
+ */
+@Composable
+fun HomeLoadingShimmer(sidePad: Dp = 40.dp) {
+    Column(Modifier.fillMaxSize().shimmer()) {
+        ShimmerBlock(Modifier.fillMaxWidth().height(500.dp), alpha = 0.08f, corner = 0.dp) // upstream: View alpha 0.25 x base alpha 0.2
+        Column(Modifier.padding(start = sidePad, end = sidePad, top = 16.dp), verticalArrangement = Arrangement.spacedBy(22.dp)) {
+            repeat(3) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ShimmerBlock(Modifier.width(170.dp).height(22.dp), corner = 4.dp) // loading_line_short
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) { repeat(10) { ShimmerBlock(Modifier.width(150.dp).height(225.dp)) } }
+                }
+            }
+        }
+    }
+}
+
+/** Row heading in the Netflix style: bold, white, optional muted trailing text. */
+@Composable
+fun RowTitle(text: String, trailing: String? = null) {
+    Row(Modifier.padding(bottom = 10.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(text, style = MaterialTheme.typography.titleLarge, color = Color.White)
+        if (trailing != null) Text(trailing, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = 3.dp))
+    }
+}
+
+/** White "Play"-style button. */
+@Composable
+fun PrimaryButton(text: String, onClick: () -> Unit, enabled: Boolean = true, leading: String? = "▶") {
+    androidx.compose.material3.Button(
+        onClick, enabled = enabled, shape = RoundedCornerShape(4.dp),
+        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 22.dp, vertical = 10.dp),
+    ) { Text((leading?.let { "$it  " } ?: "") + text, fontWeight = FontWeight.Bold, fontSize = 16.sp) }
+}
+
+/** Translucent grey secondary button ("More info", "My List"). */
+@Composable
+fun GhostButton(text: String, onClick: () -> Unit, enabled: Boolean = true) {
+    androidx.compose.material3.Button(
+        onClick, enabled = enabled, shape = RoundedCornerShape(4.dp),
+        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color(0x99606068), contentColor = Color.White),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp, vertical = 10.dp),
+    ) { Text(text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp) }
+}
+
+/** Standard content padding for screens under the floating top bar. */
+fun Modifier.screenPadding() = this.padding(start = 40.dp, end = 40.dp, top = TopBarHeight + 12.dp, bottom = 16.dp)
+
+@Composable fun Spacer4() = Box(Modifier.height(4.dp))
+@Composable fun Spacer8() = Box(Modifier.height(8.dp))
+@Composable fun Spacer16() = Box(Modifier.height(16.dp))
+
+@Composable
+fun CenteredProgress(text: String? = null, modifier: Modifier = Modifier.fillMaxSize()) {
+    Box(modifier, contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator()
+            if (text != null) { Spacer8(); Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        }
+    }
+}
+
+@Composable
+fun ErrorText(message: String, modifier: Modifier = Modifier) {
+    Text(message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = modifier)
+}
+
+@Composable
+fun Badge(text: String, color: Color = MaterialTheme.colorScheme.secondaryContainer, textColor: Color = MaterialTheme.colorScheme.onSecondaryContainer) {
+    Surface(color = color, shape = RoundedCornerShape(6.dp)) {
+        Text(text, Modifier.padding(horizontal = 8.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = textColor)
+    }
+}
+
+@Composable
+fun SectionCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Card(
+        modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+    ) { Column(Modifier.padding(18.dp)) { content() } }
+}
+
+@Composable
+fun ScreenTitle(text: String, trailing: @Composable () -> Unit = {}) {
+    Row(Modifier.fillMaxWidth().padding(bottom = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(text, style = MaterialTheme.typography.headlineMedium, color = Color.White)
+        trailing()
+    }
+}
+
+@Composable
+fun Dot(color: Color, size: Dp = 8.dp) = Box(Modifier.size(size).clip(RoundedCornerShape(50)).background(color))

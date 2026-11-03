@@ -1,0 +1,23 @@
+{
+  "datastore": {
+    "_Bool": {"some_flag": true},
+    "_Int": {"0/result_watch_state/100": 1},
+    "_String": {
+      "REPOSITORIES_KEY": "[{\"iconUrl\":null,\"name\":\"My Repo\",\"url\":\"https://example.org/repo.json\",\"description\":\"d\"}]",
+      "0/result_watch_state_data/100": "{\"bookmarkedTime\":1700000000000,\"id\":100,\"latestUpdatedTime\":1700000000001,\"name\":\"Naruto\",\"url\":\"https://x/naruto\",\"apiName\":\"DemoAnime\",\"type\":\"Anime\",\"posterUrl\":null,\"year\":2002}",
+      "0/result_watch_state_data/200": "{\"bookmarkedTime\":1700000005000,\"id\":200,\"latestUpdatedTime\":1,\"name\":\"Movie\",\"url\":\"https://x/m\",\"apiName\":\"Other\",\"type\":\"Movie\",\"posterUrl\":\"p.jpg\",\"year\":null}",
+      "0/video_pos_dur/100": "{\"position\":30000,\"duration\":120000}"
+    },
+    "_Float": {"some_float": 0.5},
+    "_Long": {"some_long": 123456789012},
+    "_StringSet": {"user_pinned_providers": ["A", "B"]}
+  },
+  "settings": {
+    "_Bool": {"pref_bool": true},
+    "_Int": {"pref_int": 7},
+    "_String": {"download_path_key": "content://secret", "pref_str": "hello"},
+    "_Float": {},
+    "_Long": {},
+    "_StringSet": {"pref_set": ["x", "y"]}
+  }
+}

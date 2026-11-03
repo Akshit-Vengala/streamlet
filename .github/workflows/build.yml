@@ -1,0 +1,49 @@
+# Builds, tests and packages Streamlet on Windows and Linux (jpackage only targets the host OS).
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package: packageMsi packageExe
+          - os: ubuntu-22.04
+            package: packageDeb packageRpm packageAppImage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Linux packaging tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm fakeroot libmpv2 || sudo apt-get install -y rpm fakeroot libmpv1
+      - name: Test
+        shell: bash
+        run: ./gradlew --no-configuration-cache :contracts:test :storage:test :plugin-loader:test :android-shim:test :player:test :desktop-app:test
+      - name: Package
+        shell: bash
+        run: |
+          for t in ${{ matrix.package }}; do ./gradlew --no-configuration-cache :desktop-app:$t; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamlet-${{ runner.os }}
+          path: |
+            desktop-app/build/compose/binaries/main/msi/*.msi
+            desktop-app/build/compose/binaries/main/exe/*.exe
+            desktop-app/build/compose/binaries/main/deb/*.deb
+            desktop-app/build/compose/binaries/main/rpm/*.rpm
+            desktop-app/build/compose/binaries/main/app/**
+          if-no-files-found: warn

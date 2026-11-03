@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- App mark (name-neutral): a play triangle riding three stream lines on a rounded tile. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF3B47"/>
+      <stop offset="1" stop-color="#B00610"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#gloss)"/>
+  <!-- stream lines -->
+  <rect x="88" y="174" width="120" height="30" rx="15" fill="#FFFFFF" fill-opacity="0.55"/>
+  <rect x="64" y="241" width="144" height="30" rx="15" fill="#FFFFFF" fill-opacity="0.75"/>
+  <rect x="88" y="308" width="120" height="30" rx="15" fill="#FFFFFF" fill-opacity="0.55"/>
+  <!-- play -->
+  <path d="M232 140 C232 124 249 115 263 123 L410 233 C422 242 422 270 410 279 L263 389 C249 397 232 388 232 372 Z" fill="#FFFFFF"/>
+</svg>

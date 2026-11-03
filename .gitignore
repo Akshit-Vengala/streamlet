@@ -1,0 +1,23 @@
+.gradle/
+build/
+*.class
+spike/jar/
+spike/libs/
+spike/cs3/*.cs3
+tools/bin/
+.idea/
+*.iml
+local.properties
+
+# Local only: data about specific extensions / repositories (never committed)
+reports/
+spike/cs3/
+spike/spike-output.txt
+spike/android-refs.txt
+tools/compat-harness/known-broken.json
+# Local working notes (they name extensions)
+PROGRESS.md
+PLAN.md
+# Tool / IDE state
+.claude/
+.kotlin/
