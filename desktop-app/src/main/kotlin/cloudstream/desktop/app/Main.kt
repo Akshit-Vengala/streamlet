@@ -63,7 +63,9 @@ data class CliArgs(
 fun main(argv: Array<String>) {
     // NOTE: compose.layers.type=WINDOW (popups as native windows) crashed natively in skiko's Direct3D redrawer
     // (re-entrant reshape during render). The player instead hides the video surface while one of its menus is open.
-    installErrorLog()
+    // Log file, stdout/stderr capture and uncaught exceptions (UI thread included): <data>/logs/streamlet.0.log.
+    AppLog.install()
+    AppLog.banner(argv)
     // Draw on the discrete GPU on hybrid laptops (the high-refresh panel is usually wired to it); -D overrides.
     if (System.getProperty("skiko.directx.gpu.priority") == null) System.setProperty("skiko.directx.gpu.priority", "discrete")
     // CLOUDSTREAM_FPS=1: skiko prints the frame rate and long frames to the console (diagnosing stutter).
@@ -76,6 +78,7 @@ fun main(argv: Array<String>) {
     if ("--home-shot" in argv) exitProcess(HomeShot.run(argv))
     if ("--player-shot" in argv) exitProcess(PlayerShot.run(argv))
     if ("--menu-shot" in argv) exitProcess(MenuShot.run(argv))
+    argv.indexOf("--render-icons").takeIf { it >= 0 }?.let { exitProcess(IconExport.run(File(argv[it + 1]))) }
     // `--update-check OWNER/NAME [current]`: what the app updater sees for that repo's latest GitHub release.
     argv.indexOf("--update-check").takeIf { it >= 0 }?.let { i ->
         val u = cloudstream.desktop.app.update.AppUpdater(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO),
@@ -100,31 +103,14 @@ fun main(argv: Array<String>) {
     val services = if (args.fakes) AppServices.fakes(seedInstalled = true)
     else AppServices.real(AppServices.appRoot(args.dataDir))
     val controller = AppController(services)
+    AppLog.get("app").info("Services ready (${services.mode})")
+    AppLog.startFreezeWatch()
+    if (!args.fakes) Thread({ runCatching { DiskCleanup.run() }.onFailure { AppLog.get("cleanup").warning("Cleanup failed: $it") } }, "disk-cleanup")
+        .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
     runWindow(controller)
+    AppLog.get("app").info("Window closed, shutting down")
     services.close()
     exitProcess(0)
-}
-
-/**
- * Uncaught exceptions (UI thread included) go to `<data>/logs/errors.log` with their full trace. Plugins sometimes throw
- * exceptions whose own toString/printStackTrace fail, which left only "Exception in thread ..." on the console.
- */
-private fun installErrorLog() {
-    val file = File(cloudstream.desktop.contracts.AppDirs.root, "logs/errors.log")
-    val previous = Thread.getDefaultUncaughtExceptionHandler()
-    Thread.setDefaultUncaughtExceptionHandler { t, e ->
-        runCatching {
-            file.parentFile.mkdirs()
-            if (file.length() > 5_000_000) file.writeText("") // keep it small
-            val sw = java.io.StringWriter()
-            val trace = runCatching { e.printStackTrace(java.io.PrintWriter(sw)); sw.toString() }.getOrElse {
-                // A broken toString/getMessage: fall back to class name + raw frames.
-                "${e.javaClass.name} (message unavailable: $it)\n" + e.stackTrace.joinToString("\n") { "\tat $it" }
-            }
-            file.appendText("---- ${java.time.LocalDateTime.now()} thread=${t.name}\n$trace\n")
-        }
-        if (previous != null) previous.uncaughtException(t, e) else System.err.println("Uncaught on ${t.name}: ${e.javaClass.name} (see ${file.absolutePath})")
-    }
 }
 
 @OptIn(FlowPreview::class)
@@ -150,15 +136,26 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
     }
     val searchFocus = remember { FocusRequester() }
     var wantSearchFocus by remember { mutableStateOf(0) }
+    val playerKeysDown = remember { HashSet<Key>() }
     Window(
         onCloseRequest = ::exitApplication,
         state = state,
         icon = cloudstream.desktop.app.ui.AppLogo.painter,
         title = "Streamlet" + if (c.services.mode == AppServices.Mode.Fakes) " (fake data)" else "",
         onPreviewKeyEvent = { e ->
-            // The player (when open) gets every key first, whatever has focus.
-            if (c.nav.current is Screen.Player && e.type == KeyEventType.KeyDown &&
-                cloudstream.desktop.app.ui.PlayerKeys.handler?.invoke(e.key, e.isShiftPressed, e.isAltPressed, e.isCtrlPressed) == true) return@Window true
+            // The player (when open) gets every key first, whatever has focus. The release of a key it handled is
+            // swallowed too: otherwise a focused button (e.g. the play button just clicked) "clicked" on Space's
+            // release and undid the pause.
+            if (c.nav.current is Screen.Player) {
+                if (e.type == KeyEventType.KeyDown &&
+                    cloudstream.desktop.app.ui.PlayerKeys.handler?.invoke(e.key, e.isShiftPressed, e.isAltPressed, e.isCtrlPressed) == true) {
+                    playerKeysDown += e.key; return@Window true
+                }
+                if (e.type == KeyEventType.KeyUp) {
+                    val up = cloudstream.desktop.app.ui.PlayerKeys.keyUp?.invoke(e.key) == true
+                    if (playerKeysDown.remove(e.key) || up) return@Window true
+                }
+            }
             if (e.type != KeyEventType.KeyDown) return@Window false
             when {
                 e.isCtrlPressed && e.key == Key.One -> { c.goTo(Screen.Home); true }
@@ -179,6 +176,14 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
             var saved: Pair<java.awt.Rectangle, Int>? = null
             c.fullscreen.collect { fs ->
                 val w = window
+                // Linux (X11 / XWayland): ask the window manager for real fullscreen (_NET_WM_STATE_FULLSCREEN). The
+                // off-screen-title-bar trick below is clamped by most Linux WMs (the title bar stays visible).
+                if (cloudstream.desktop.contracts.Os.isLinux) {
+                    val dev = w.graphicsConfiguration.device
+                    if (fs && dev.fullScreenWindow !== w) runCatching { dev.fullScreenWindow = w }
+                    else if (!fs && dev.fullScreenWindow === w) runCatching { dev.fullScreenWindow = null }
+                    return@collect
+                }
                 if (fs && saved == null) {
                     saved = w.bounds to w.extendedState
                     w.extendedState = java.awt.Frame.NORMAL

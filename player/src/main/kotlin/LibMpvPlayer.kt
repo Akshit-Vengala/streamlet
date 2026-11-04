@@ -44,6 +44,15 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
     val subtitleErrors = java.util.concurrent.CopyOnWriteArrayList<String>()
     @Volatile private var attached: Component? = null
     private var fullscreenWindow: Window? = null
+    private val log = java.util.logging.Logger.getLogger("streamlet.mpv")
+    @Volatile private var lastLogged: String? = null
+
+    /** URL query strings (tokens, signatures) are not written to the log. */
+    private fun redactUrl(url: String): String {
+        val q = url.indexOf('?')
+        return if (q < 0) url else url.substring(0, q) + "?…"
+    }
+    private fun redactLine(s: String) = Regex("""(https?://[^\s?'"]+)\?[^\s'"]*""").replace(s) { it.groupValues[1] + "?…" }
 
     init {
         // wid must be set before initialize; attachTo() is therefore expected before first use,
@@ -131,6 +140,11 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
                 val m = ev.getPointer(16) ?: continue
                 val line = "[${m.getPointer(0)?.getString(0) ?: "mpv"}] ${m.getPointer(16)?.getString(0)?.trim() ?: ""}"
                 synchronized(recentLog) { recentLog.addLast(line); while (recentLog.size > 6) recentLog.removeFirst() }
+                if (line != lastLogged) { // mpv repeats some warnings every frame
+                    lastLogged = line
+                    val lvl = m.getPointer(8)?.getString(0)
+                    log.log(if (lvl == "error" || lvl == "fatal") java.util.logging.Level.WARNING else java.util.logging.Level.INFO, redactLine(line))
+                }
             }
             if (id == 8) { // MPV_EVENT_FILE_LOADED: pick the subtitle and attach the link's subtitle files (sub-add needs a loaded file)
                 val subs = pendingSubs; pendingSubs = emptyList()
@@ -141,21 +155,22 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
                     pick == SUB_OFF -> setProp("sid", "no")
                 }
                 val selectExternal = own == null && pick != SUB_OFF
-                subs.forEachIndexed { i, s ->
-                    // The first external (preferred language first, see buildPlaybackSource) is selected only when the
-                    // stream has no subtitle of its own to show; the rest are listed only.
-                    // Async: each sub-add downloads its file; a slow subtitle host must never block anything.
-                    val reply = cmdId("sub-add", s.url, if (i == 0 && selectExternal) "select" else "auto", s.lang, s.lang)
-                    subAddReplies[reply] = s.lang
-                }
+                // Only the subtitle that will show is loaded (like CloudStream): mpv parses every added file on its
+                // playback thread, and episodes often offer 200+ subtitles, which made playback hitch. The first
+                // external one (preferred language first, see buildPlaybackSource) shows when the stream has no
+                // subtitle of its own; any other is loaded when the user picks it (setSubtitle).
+                if (selectExternal) subs.firstOrNull()?.let { addSubtitle(it, "select") }
             }
             if (id == 5) { // MPV_EVENT_COMMAND_REPLY {event_id, error, reply_userdata, ...}
                 val err = ev.getInt(4); val reply = ev.getLong(8)
                 val lang = subAddReplies.remove(reply)
                 // A failed subtitle is not a playback error (that would trigger source fallback): just note it.
                 if (lang != null && err < 0) subtitleErrors += "$lang: ${api.mpv_error_string(err)}"
+                if (lang != null && err < 0) log.warning("Subtitle $lang failed: ${api.mpv_error_string(err)}")
             }
             if (id == 6) currentStarted = true // MPV_EVENT_START_FILE of the file we opened last
+            if (id == 8) log.info("File loaded: ${prop("video-codec") ?: "?"} ${prop("width") ?: "?"}x${prop("height") ?: "?"}, " +
+                "hwdec ${prop("hwdec-current") ?: "?"}, duration ${prop("duration")?.toDoubleOrNull()?.toLong() ?: "?"} s")
             if (id == 7) { // MPV_EVENT_END_FILE
                 // The previous file's END_FILE arrives AFTER a new loadfile: ignore it, it is not about the new file.
                 if (!currentStarted) continue
@@ -163,6 +178,7 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
                 if (data.getInt(0) == 4) {
                     val raw = synchronized(recentLog) { recentLog.distinct().joinToString(" | ") }
                     lastError = "Playback failed: ${api.mpv_error_string(data.getInt(4))}" + if (raw.isNotEmpty()) " -- $raw" else ""
+                    log.warning(redactLine(lastError!!))
                 }
             }
         }
@@ -188,11 +204,53 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
             error = lastError,
             bufferPercent = if (buffering) prop("cache-buffering-state")?.toIntOrNull()?.coerceIn(0, 100) else null,
         )
+        logPlaybackHealth(cache, paused || idle || ended, pos)
+    }
+
+    // Stutter diagnostics: cache stalls as they happen, and every 30 s while playing what dropped and why.
+    private var stallSince = 0L
+    private var lastStats = 0L
+    private var lastDrops = 0L to 0L
+    private var lastGc = 0L to 0L
+    private var pollGapMax = 0L
+    private var lastPoll = 0L
+
+    private fun logPlaybackHealth(cacheStall: Boolean, stopped: Boolean, pos: Double) {
+        val now = System.currentTimeMillis()
+        if (lastPoll != 0L) pollGapMax = maxOf(pollGapMax, now - lastPoll)
+        lastPoll = now
+        if (cacheStall && stallSince == 0L) {
+            stallSince = now
+            log.info("Buffering at ${pos.toLong()} s: cache ${prop("demuxer-cache-duration")?.toDoubleOrNull()?.let { "%.1f".format(Locale.ROOT, it) } ?: "?"} s ahead, " +
+                "input ${prop("cache-speed")?.toLongOrNull()?.let { it / 1024 } ?: "?"} KB/s")
+        } else if (!cacheStall && stallSince != 0L) {
+            log.info("Resumed after ${now - stallSince} ms of buffering"); stallSince = 0L
+        }
+        if (stopped || now - lastStats < 30_000) return
+        if (lastStats == 0L) { lastStats = now; return }
+        lastStats = now
+        val drops = (prop("frame-drop-count")?.toLongOrNull() ?: 0L) to (prop("decoder-frame-drop-count")?.toLongOrNull() ?: 0L)
+        val gcs = java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()
+        val gc = gcs.sumOf { it.collectionCount.coerceAtLeast(0) } to gcs.sumOf { it.collectionTime.coerceAtLeast(0) }
+        val vo = drops.first - lastDrops.first; val dec = drops.second - lastDrops.second
+        val r = renderer
+        log.info("Playback 30 s: dropped ${vo} (vo) + ${dec} (decoder), delayed ${prop("vo-delayed-frame-count") ?: "?"} total, " +
+            "cache ${prop("demuxer-cache-duration")?.toDoubleOrNull()?.let { "%.0f".format(Locale.ROOT, it) } ?: "?"} s, " +
+            "input ${prop("cache-speed")?.toLongOrNull()?.let { it / 1024 } ?: "?"} KB/s, hwdec ${prop("hwdec-current")?.ifBlank { "no" } ?: "?"}, " +
+            "fps ${prop("estimated-vf-fps")?.toDoubleOrNull()?.let { "%.1f".format(Locale.ROOT, it) } ?: "?"}, " +
+            "display ${prop("display-fps")?.toDoubleOrNull()?.let { "%.0f".format(Locale.ROOT, it) } ?: "?"} Hz, " +
+            (r?.let { "frames ${it.frameSeq.value}, " } ?: "") +
+            "GC ${gc.first - lastGc.first}x ${gc.second - lastGc.second} ms, max poll gap $pollGapMax ms, " +
+            "heap ${(Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) shr 20} MB")
+        lastDrops = drops; lastGc = gc; pollGapMax = 0
     }
 
     override fun open(source: PlaybackSource) {
         currentStarted = false
         lastError = null
+        openGeneration++
+        currentHeaders = source.headers + (source.referer?.takeIf { it.isNotBlank() && source.headers.keys.none { k -> k.equals("Referer", true) } }
+            ?.let { mapOf("Referer" to it) } ?: emptyMap())
         synchronized(recentLog) { recentLog.clear() }
         val cfg = MpvOptions.map(source)
         for ((k, v) in cfg.options) setProp(k, v)
@@ -202,6 +260,9 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
         // Built-in tracks in the preferred language are picked automatically (the external one, if any, wins: added + selected later).
         cfg.subtitles.firstOrNull()?.lang?.let { l -> setProp("slang", MpvOptions.langCodes(l).joinToString(",")) }
         setProp("pause", "no")
+        log.info("Opening ${redactUrl(cfg.url)} (headers: ${source.headers.keys.joinToString().ifEmpty { "none" }}" +
+            (if (source.referer.isNullOrBlank()) "" else ", referer") + "); ${cfg.subtitles.size} subtitle(s)" +
+            cfg.subtitles.take(8).joinToString(", ", ": ") { it.lang + if (it.headers.isEmpty()) "" else " [${it.headers.keys.joinToString("/")}]" })
         cmd("loadfile", cfg.url, "replace")
     }
 
@@ -250,11 +311,71 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
     override fun stop() { cmd("stop"); st.value = PlayerState(0, 0, false, false, null) }
 
     override fun setSubtitle(track: SubtitleSource?) {
-        if (track == null) setProp("sid", "no") else cmd("sub-add", track.url, "select", track.lang, track.lang)
+        if (track == null) { setProp("sid", "no"); return }
+        // Already loaded into this file: select it instead of adding a duplicate track.
+        val loaded = tracks("sub").firstOrNull { it.external && it.source == track.url }
+        if (loaded != null) setProp("sid", loaded.id.toString()) else addSubtitle(track, "select")
+    }
+
+    /** Local copy -> the subtitle's original URL (the app knows subtitles by URL; mpv reports the file it loaded). */
+    private val subFiles = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val subCache = java.util.concurrent.ConcurrentHashMap<String, java.io.File>()
+    @Volatile private var openGeneration = 0
+    @Volatile private var currentHeaders: Map<String, String> = emptyMap()
+    private val subClient by lazy {
+        java.net.http.HttpClient.newBuilder().followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+            .connectTimeout(java.time.Duration.ofSeconds(15)).build()
+    }
+
+    /**
+     * Like CloudStream, an online subtitle is downloaded by the app WITH its own headers (the extension's Referer /
+     * cookies; else the video's), then handed to mpv as a local file. mpv's own fetch sends only the video's headers,
+     * which subtitle hosts often refuse (403/404). In the background: a slow subtitle host never blocks anything.
+     */
+    private fun addSubtitle(s: SubtitleSource, flag: String) {
+        val gen = openGeneration
+        scope.launch {
+            val local = if (s.url.startsWith("http://", true) || s.url.startsWith("https://", true)) fetchSubtitle(s) ?: return@launch else null
+            if (gen != openGeneration && flag != "select") return@launch // the file changed meanwhile
+            val path = local?.absolutePath ?: s.url
+            local?.let { subFiles[it.absolutePath] = s.url }
+            val reply = cmdId("sub-add", path, flag, s.lang, s.lang)
+            subAddReplies[reply] = s.lang
+        }
+    }
+
+    private fun fetchSubtitle(s: SubtitleSource): java.io.File? {
+        subCache[s.url]?.takeIf { it.isFile }?.let { return it }
+        val headers = s.headers.ifEmpty { currentHeaders }
+        return try {
+            val b = java.net.http.HttpRequest.newBuilder(java.net.URI(s.url)).timeout(java.time.Duration.ofSeconds(30))
+            for ((k, v) in headers) if (!k.equals("Range", true) && !k.equals("Host", true) && !k.equals("Content-Length", true)) runCatching { b.header(k, v) }
+            if (headers.keys.none { it.equals("User-Agent", true) }) b.header("User-Agent", MpvOptions.DEFAULT_UA)
+            val r = subClient.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray())
+            if (r.statusCode() !in 200..299) {
+                log.warning("Subtitle ${s.lang}: HTTP ${r.statusCode()} from ${redactUrl(s.url)} (headers: ${headers.keys.joinToString().ifEmpty { "none" }})")
+                subtitleErrors += "${s.lang}: HTTP ${r.statusCode()}"
+                return null
+            }
+            var body = r.body()
+            if (r.headers().firstValue("content-encoding").orElse("").equals("gzip", true) ||
+                (body.size > 2 && body[0] == 0x1f.toByte() && body[1] == 0x8b.toByte())) body = java.util.zip.GZIPInputStream(body.inputStream()).readBytes()
+            val ext = s.url.substringBefore('?').substringAfterLast('.', "").lowercase().takeIf { it in setOf("vtt", "srt", "ass", "ssa", "sub", "ttml", "dfxp") } ?: "vtt"
+            val dir = java.io.File(System.getProperty("java.io.tmpdir"), "streamlet-subs").apply { mkdirs() }
+            val f = java.io.File(dir, "${Integer.toHexString(s.url.hashCode())}-${s.lang.filter { it.isLetterOrDigit() }.take(20)}.$ext")
+            f.writeBytes(body); f.deleteOnExit()
+            log.info("Subtitle ${s.lang}: ${body.size / 1024} KB from ${redactUrl(s.url)}")
+            subCache[s.url] = f
+            f
+        } catch (t: Throwable) {
+            log.warning("Subtitle ${s.lang}: ${t::class.simpleName}: ${t.message} (${redactUrl(s.url)})")
+            subtitleErrors += "${s.lang}: ${t.message ?: t::class.simpleName}"
+            null
+        }
     }
 
     override fun setVolume(percent: Int) = setProp("volume", percent.coerceIn(0, 130).toString())
-    override fun setSpeed(speed: Double) = setProp("speed", "%.2f".format(Locale.ROOT, speed.coerceIn(0.25, 4.0)))
+    override fun setSpeed(speed: Double) = setProp("speed", "%.2f".format(Locale.ROOT, speed.coerceIn(0.1, 4.0)))
     override fun setAudioTrack(id: Int) = setProp("aid", id.toString())
     override fun setSubtitleTrack(id: Int?) = setProp("sid", id?.toString() ?: "no")
     override fun audioTracks() = tracks("audio")
@@ -290,7 +411,7 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
                 prop("track-list/$i/selected") == "yes",
                 external = prop("track-list/$i/external") == "yes",
                 forced = prop("track-list/$i/forced") == "yes",
-                source = prop("track-list/$i/external-filename"),
+                source = prop("track-list/$i/external-filename")?.let { subFiles[it] ?: subFiles[java.io.File(it).absolutePath] ?: it },
             )
         }
     }

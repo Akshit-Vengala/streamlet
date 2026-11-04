@@ -88,9 +88,16 @@ class DesktopPluginRepository(
         return client.listAvailable(repo)
     }
 
-    override suspend fun install(plugin: PluginInfo): InstalledPlugin = mutex.withLock { installLocked(plugin) }
+    private val log = java.util.logging.Logger.getLogger("streamlet.extensions")
+
+    override suspend fun install(plugin: PluginInfo): InstalledPlugin = mutex.withLock {
+        runCatching { installLocked(plugin) }
+            .onFailure { log.log(java.util.logging.Level.WARNING, "Install of ${plugin.internalName} v${plugin.version} failed", it) }
+            .getOrThrow()
+    }
 
     private suspend fun installLocked(plugin: PluginInfo): InstalledPlugin = withContext(Dispatchers.IO) {
+        log.info("Installing ${plugin.internalName} v${plugin.version}")
         val bytes = client.downloadBytes(plugin.url)
         val hash = sha256Hex(bytes)
         plugin.fileHash?.let { expected ->
@@ -116,6 +123,7 @@ class DesktopPluginRepository(
     override suspend fun uninstall(internalName: String) {
         mutex.withLock {
             val rec = state.installed.firstOrNull { it.info.internalName == internalName } ?: return
+            log.info("Uninstalling $internalName v${rec.info.version}")
             val cs3 = File(rec.cs3Path)
             loader.unload(cs3)
             loader.guard?.revoke(PluginGuard.keyOf(cs3)) // a reinstall is checked afresh
@@ -150,6 +158,13 @@ class DesktopPluginRepository(
     }
 
     override suspend fun update(internalName: String): InstalledPlugin = mutex.withLock {
+        runCatching { updateLocked(internalName) }
+            .onSuccess { log.info("Updated $internalName to v${it.info.version}") }
+            .onFailure { log.warning("Update of $internalName failed: ${it.message}") }
+            .getOrThrow()
+    }
+
+    private suspend fun updateLocked(internalName: String): InstalledPlugin {
         val rec = state.installed.firstOrNull { it.info.internalName == internalName }
             ?: error("Plugin '$internalName' is not installed")
         val repo = state.repos.firstOrNull { it.url == rec.info.repoUrl } ?: client.addRepo(rec.info.repoUrl)
@@ -180,7 +195,7 @@ class DesktopPluginRepository(
         loader.guard?.pendingUpdates?.remove(PluginGuard.keyOf(cs3))
         if (!wasLoaded) loader.unload(cs3)
         backup.delete()
-        inst
+        return inst
     }
 
     override fun installed(): List<InstalledPlugin> =

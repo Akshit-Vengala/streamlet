@@ -4,9 +4,31 @@ package android.webkit;
 public class WebSettings {
     public WebSettings() { }
 
-    /** The browser engine's real user agent (keep equal to webview-desktop's JcefRuntime.DEFAULT_USER_AGENT). */
+    /**
+     * The browser engine's real user agent, for the OS it actually runs on (keep equal to webview-desktop's
+     * JcefRuntime.DEFAULT_USER_AGENT). Claiming Windows on Linux is a mismatch Cloudflare detects (fonts, WebGL, TLS).
+     */
     public static final String ENGINE_USER_AGENT =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+        "Mozilla/5.0 (" + osToken() + ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+    /** The platform part of Chrome's desktop user agent for this machine. */
+    public static String osToken() {
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        boolean arm = arch.contains("aarch64") || arch.contains("arm");
+        if (os.startsWith("windows")) return "Windows NT 10.0; Win64; x64";
+        if (os.contains("mac")) return "Macintosh; Intel Mac OS X 10_15_7"; // Chrome reports this on Apple silicon too
+        return arm ? "X11; Linux aarch64" : "X11; Linux x86_64";
+    }
+
+    /** windows / mac / android / linux / other, from a user agent string. */
+    static String osOf(String ua) {
+        if (ua.contains("Android")) return "android";
+        if (ua.contains("Windows NT")) return "windows";
+        if (ua.contains("Mac OS X")) return "mac";
+        if (ua.contains("Linux") || ua.contains("X11")) return "linux";
+        return "other";
+    }
 
     public static java.lang.String getDefaultUserAgent(android.content.Context a0) { return ENGINE_USER_AGENT; }
 
@@ -29,7 +51,7 @@ public class WebSettings {
         java.util.regex.Matcher a = java.util.regex.Pattern.compile("Chrome/(\\d+)").matcher(ua);
         java.util.regex.Matcher e = java.util.regex.Pattern.compile("Chrome/(\\d+)").matcher(ENGINE_USER_AGENT);
         if (!a.find() || !e.find() || !a.group(1).equals(e.group(1))) return false;
-        boolean sameOs = ua.contains("Windows NT") == ENGINE_USER_AGENT.contains("Windows NT") && ua.contains("Android") == ENGINE_USER_AGENT.contains("Android");
+        boolean sameOs = osOf(ua).equals(osOf(ENGINE_USER_AGENT));
         return sameOs && ua.contains("Mobile") == ENGINE_USER_AGENT.contains("Mobile");
     }
     public void setAllowContentAccess(boolean a0) { cloudstream.desktop.androidshim.Stub.hit("android.webkit.WebSettings.setAllowContentAccess"); }

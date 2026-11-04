@@ -61,8 +61,16 @@ fun isNewerVersion(candidate: String, current: String): Boolean {
  * instead). Package type preference first; within it, a name for this CPU beats a neutral one, and one built for
  * another CPU (arm64 on x64 or the other way round) is never picked.
  */
-fun pickInstaller(names: List<String>, windows: Boolean, arch: String = System.getProperty("os.arch").orEmpty()): String? {
-    val prefs = if (windows) listOf(".msi", ".exe") else listOf(".appimage", ".deb", ".rpm")
+fun pickInstaller(
+    names: List<String>, windows: Boolean, arch: String = System.getProperty("os.arch").orEmpty(),
+    linuxPackage: String? = detectLinuxPackage(),
+): String? {
+    // Linux: the system's own package type first (a .deb is useless on Fedora), then the other, then an AppImage.
+    val prefs = if (windows) listOf(".msi", ".exe") else when (linuxPackage) {
+        ".rpm" -> listOf(".rpm", ".appimage", ".deb")
+        ".deb" -> listOf(".deb", ".appimage", ".rpm")
+        else -> listOf(".appimage", ".deb", ".rpm")
+    }
     val arm = arch.lowercase().let { it.contains("aarch64") || it.contains("arm") }
     val mine = if (arm) listOf("arm64", "aarch64") else listOf("x64", "amd64", "x86_64", "win64")
     val other = if (arm) listOf("x64", "amd64", "x86_64", "win64") else listOf("arm64", "aarch64", "armv7", "armhf")
@@ -72,6 +80,31 @@ fun pickInstaller(names: List<String>, windows: Boolean, arch: String = System.g
         fits.firstOrNull()?.let { return it }
     }
     return null
+}
+
+/** ".deb" (Debian/Ubuntu/Mint: dpkg), ".rpm" (Fedora/openSUSE/RHEL: rpm without dpkg), else null. */
+fun detectLinuxPackage(): String? {
+    if (System.getProperty("os.name").orEmpty().lowercase().contains("win")) return null
+    fun has(vararg p: String) = p.any { File(it).exists() }
+    return when {
+        has("/usr/bin/dpkg", "/bin/dpkg") -> ".deb"
+        has("/usr/bin/rpm", "/bin/rpm") -> ".rpm"
+        else -> null
+    }
+}
+
+/** The terminal command that installs a downloaded Linux package (null for other files). */
+fun linuxInstallCommand(file: File): String? {
+    val p = "'" + file.absolutePath.replace("'", "'\\''") + "'"
+    fun has(vararg c: String) = c.any { File(it).exists() }
+    val n = file.name.lowercase()
+    return when {
+        n.endsWith(".deb") -> "sudo apt install $p"
+        n.endsWith(".rpm") && has("/usr/bin/dnf", "/bin/dnf") -> "sudo dnf install $p"
+        n.endsWith(".rpm") && has("/usr/bin/zypper") -> "sudo zypper install $p"
+        n.endsWith(".rpm") -> "sudo rpm -U $p"
+        else -> null
+    }
 }
 
 /**
@@ -86,6 +119,20 @@ class AppUpdater(
 ) {
     private val _state = MutableStateFlow<UpdateState>(if (repo.isBlank()) UpdateState.NotConfigured else UpdateState.Idle)
     val state: StateFlow<UpdateState> = _state.asStateFlow()
+    init {
+        val log = cloudstream.desktop.app.AppLog.get("updater")
+        scope.launch {
+            _state.collect { s ->
+                when (s) {
+                    is UpdateState.Available -> log.info("Update available: ${s.release.version} (${s.release.assetName})")
+                    is UpdateState.UpToDate -> log.info("Up to date ($current)")
+                    is UpdateState.Ready -> log.info("Update downloaded: ${s.file}")
+                    is UpdateState.Failed -> log.warning("Updater: ${s.message}")
+                    else -> {}
+                }
+            }
+        }
+    }
     val configured: Boolean get() = repo.isNotBlank()
     private val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
     private var job: Job? = null

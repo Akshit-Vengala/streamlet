@@ -19,8 +19,9 @@ data class JcefProgress(val stage: Stage, val fraction: Float?) {
 object JcefRuntime {
     /** Chromium major of the pinned jcefmaven (143.0.14). Keep in sync with build.gradle.kts. */
     const val CHROME_MAJOR = 143
-    const val DEFAULT_USER_AGENT =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$CHROME_MAJOR.0.0.0 Safari/537.36"
+    /** Chrome's own desktop user agent for the OS this runs on (a Windows claim on Linux is a detectable mismatch). */
+    val DEFAULT_USER_AGENT: String =
+        "Mozilla/5.0 (${android.webkit.WebSettings.osToken()}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$CHROME_MAJOR.0.0.0 Safari/537.36"
 
     @Volatile
     var installDir: File = defaultInstallDir()
@@ -104,6 +105,9 @@ object JcefRuntime {
             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows", "--disable-features=CalculateNativeWinOcclusion",
         )
+        // Disk: no auto-downloaded Chromium components (DRM, text-to-speech, suggestion models: ~120 MB this browser
+        // never uses; DiskCleanup removes old copies), and a 32 MB HTTP cache instead of Chromium's default of up to GBs.
+        builder.addJcefArgs("--disable-component-update", "--disk-cache-size=33554432")
         // Diagnostics: extra Chromium switches, e.g. -Dcloudstream.jcef.args="--disable-gpu".
         System.getProperty("cloudstream.jcef.args")?.split(' ')?.filter { it.isNotBlank() }?.let { extra ->
             if (extra.isNotEmpty()) builder.addJcefArgs(*extra.toTypedArray())

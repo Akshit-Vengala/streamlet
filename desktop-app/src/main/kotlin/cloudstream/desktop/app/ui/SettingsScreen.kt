@@ -226,6 +226,17 @@ private fun AboutSection(c: AppController) {
     }
     Spacer8()
     SectionCard {
+        Group("Logs")
+        Text("What the app did, including errors: attach streamlet.0.log when reporting a problem. Stream links are " +
+            "logged without their query strings; account logins are never logged.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(cloudstream.desktop.app.AppLog.dir.absolutePath, style = MaterialTheme.typography.labelMedium,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+        Spacer4()
+        OutlinedButton(onClick = { cloudstream.desktop.app.openPath(cloudstream.desktop.app.AppLog.dir.apply { mkdirs() }) }) { Text("Open logs folder") }
+    }
+    Spacer8()
+    SectionCard {
         Group("App updates")
         if (!up.configured) {
             Text(
@@ -256,10 +267,24 @@ private fun AboutSection(c: AppController) {
                     ?: androidx.compose.material3.LinearProgressIndicator(Modifier.fillMaxWidth())
             }
             is cloudstream.desktop.app.update.UpdateState.Ready -> ReleaseInfo(s.release) {
-                Button(onClick = {
+                val cmd = remember(s.file) { cloudstream.desktop.app.update.linuxInstallCommand(s.file) }
+                if (cmd == null) Button(onClick = {
                     // The installer replaces the app's files: close first (Windows MSI/EXE, AppImage).
                     if (runCatching { up.install(s.file) }.getOrDefault(false)) { c.services.close(); kotlin.system.exitProcess(0) }
                 }) { Text("Install now (closes the app)") }
+                else Column {
+                    // Linux packages: installing needs root, so the app hands it to the software center or a terminal.
+                    Text("Install it with your software center, or in a terminal:", style = MaterialTheme.typography.bodySmall)
+                    Text(cmd, style = MaterialTheme.typography.labelMedium, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { runCatching { up.install(s.file) } }) { Text("Open in software center") }
+                        OutlinedButton(onClick = {
+                            runCatching { java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(java.awt.datatransfer.StringSelection(cmd), null) }
+                            c.services.toast("Command copied")
+                        }) { Text("Copy command") }
+                    }
+                    Text("Then restart Streamlet.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
             is cloudstream.desktop.app.update.UpdateState.Failed -> Text(s.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }

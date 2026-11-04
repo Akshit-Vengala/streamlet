@@ -80,7 +80,7 @@ class AppServices(
 
     private val _toasts = MutableSharedFlow<String>(extraBufferCapacity = 32)
     val toasts: SharedFlow<String> = _toasts.asSharedFlow()
-    fun toast(msg: String) { _toasts.tryEmit(msg) }
+    fun toast(msg: String) { AppLog.get("toast").info(msg.replace('\n', ' ')); _toasts.tryEmit(msg) }
 
     override fun close() {
         scope.cancel()

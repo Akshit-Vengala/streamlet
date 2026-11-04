@@ -63,54 +63,108 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
-/** Tiny in-memory poster cache; images are fetched on IO and decoded with Skia. Failures are cached as null. */
+/**
+ * Artwork cache. Images are decoded small (they are shown as tiles), kept in memory within a byte budget, and their
+ * small versions are saved on disk (JPEG, a few tens of KB each) so the next start shows them without downloading.
+ * Failures are cached as null in memory only.
+ */
 object ImageCache {
-    private val max = 300
-    private val map = object : LinkedHashMap<String, ImageBitmap?>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap?>?) = size > max
-    }
+    /** Decoded pixels kept in memory (4 bytes per pixel). */
+    private const val MEMORY_BUDGET = 64L shl 20
+    /** Small JPEGs kept on disk; the least recently used go first. */
+    private const val DISK_BUDGET = 100L shl 20
+    val diskDir: java.io.File get() = java.io.File(cloudstream.desktop.contracts.AppDirs.root, "cache/images")
+    private class Entry(val bmp: ImageBitmap?) { val bytes = bmp?.let { it.width.toLong() * it.height * 4 } ?: 0L }
+    private var used = 0L
+    private val map = LinkedHashMap<String, Entry>(64, 0.75f, true)
     private val client by lazy {
         HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).connectTimeout(Duration.ofSeconds(8)).build()
     }
 
-    @Synchronized private fun cached(url: String): Pair<Boolean, ImageBitmap?> = if (map.containsKey(url)) true to map[url] else false to null
-    @Synchronized private fun put(url: String, v: ImageBitmap?) { map[url] = v }
+    @Synchronized private fun cached(key: String): Pair<Boolean, ImageBitmap?> = map[key]?.let { true to it.bmp } ?: (false to null)
+    @Synchronized private fun put(key: String, v: ImageBitmap?) {
+        val e = Entry(v)
+        map.put(key, e)?.let { used -= it.bytes }
+        used += e.bytes
+        // Evicted bitmaps are left to the GC: one may still be on screen, so it is never closed here.
+        val it = map.entries.iterator()
+        while (used > MEMORY_BUDGET && it.hasNext()) { val old = it.next(); if (old.value === e) continue; used -= old.value.bytes; it.remove() }
+    }
 
     /**
-     * Fetches, decodes and downscales to at most [maxPx] on the longest side, all on IO. (makeFromEncoded alone is a
-     * LAZY image: the full-size decode then happened on the render thread when it first scrolled into view, and the
-     * 2000x3000 original was resampled every frame - the scrolling stutter.)
+     * Fetches (or reads the small copy from disk), decodes and downscales to at most [maxPx] on the longest side, all
+     * on IO. (makeFromEncoded alone is a LAZY image: the full-size decode then happened on the render thread when it
+     * first scrolled into view, and the 2000x3000 original was resampled every frame - the scrolling stutter.)
      */
-    suspend fun load(url: String, maxPx: Int = 600): ImageBitmap? {
+    suspend fun load(url: String, maxPx: Int = TILE_PX): ImageBitmap? {
         val key = "$maxPx|$url"
         val (hit, v) = cached(key)
         if (hit) return v
         val bmp = withContext(Dispatchers.IO) {
             runCatching {
-                val req = HttpRequest.newBuilder(URI(url)).timeout(Duration.ofSeconds(15)).header("User-Agent", "Mozilla/5.0").build()
-                val bytes = client.send(req, HttpResponse.BodyHandlers.ofByteArray()).body()
-                decodeScaled(bytes, maxPx).toComposeImageBitmap()
+                val file = diskFile(key)
+                val small = file.takeIf { it.isFile }?.let { f ->
+                    runCatching { f.readBytes() }.getOrNull()?.also { f.setLastModified(System.currentTimeMillis()) }
+                }
+                if (small != null) toBitmap(org.jetbrains.skia.Image.makeFromEncoded(small).let { lazy -> decodeScaled(lazy, maxPx) })
+                else {
+                    val req = HttpRequest.newBuilder(URI(url)).timeout(Duration.ofSeconds(15)).header("User-Agent", "Mozilla/5.0").build()
+                    val bytes = client.send(req, HttpResponse.BodyHandlers.ofByteArray()).body()
+                    val img = decodeScaled(org.jetbrains.skia.Image.makeFromEncoded(bytes), maxPx)
+                    runCatching { saveSmall(file, img) }
+                    toBitmap(img)
+                }
             }.getOrNull()
         }
         put(key, bmp)
         return bmp
     }
 
-    private fun decodeScaled(bytes: ByteArray, maxPx: Int): org.jetbrains.skia.Image {
-        val src = org.jetbrains.skia.Image.makeFromEncoded(bytes)
-        val scale = minOf(1f, maxPx.toFloat() / maxOf(src.width, src.height))
-        val w = maxOf(1, (src.width * scale).toInt()); val h = maxOf(1, (src.height * scale).toInt())
-        val surface = org.jetbrains.skia.Surface.makeRasterN32Premul(w, h)
-        surface.canvas.drawImageRect(
-            src, org.jetbrains.skia.Rect.makeWH(src.width.toFloat(), src.height.toFloat()), org.jetbrains.skia.Rect.makeWH(w.toFloat(), h.toFloat()),
-            org.jetbrains.skia.SamplingMode.MITCHELL, null, true,
-        )
-        return surface.makeImageSnapshot().also { surface.close(); src.close() }
+    private fun toBitmap(img: org.jetbrains.skia.Image): ImageBitmap = try { img.toComposeImageBitmap() } finally { img.close() }
+
+    private fun diskFile(key: String): java.io.File {
+        val h = java.security.MessageDigest.getInstance("SHA-1").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }
+        return java.io.File(diskDir, "$h.jpg")
+    }
+
+    @Volatile private var writesSinceTrim = 0
+    private fun saveSmall(file: java.io.File, img: org.jetbrains.skia.Image) {
+        val data = img.encodeToData(org.jetbrains.skia.EncodedImageFormat.JPEG, 85) ?: return
+        file.parentFile.mkdirs()
+        val tmp = java.io.File(file.parentFile, file.name + ".tmp")
+        tmp.writeBytes(data.bytes)
+        if (!tmp.renameTo(file)) { file.delete(); tmp.renameTo(file) }
+        if (++writesSinceTrim >= 50) { writesSinceTrim = 0; trimDisk() }
+    }
+
+    /** Keeps the disk cache under its budget (oldest use first). Also run at start-up (DiskCleanup). */
+    fun trimDisk() {
+        val files = diskDir.listFiles { f -> f.isFile }?.sortedBy { it.lastModified() } ?: return
+        var total = files.sumOf { it.length() }
+        for (f in files) { if (total <= DISK_BUDGET) break; total -= f.length(); f.delete() }
+    }
+
+    private fun decodeScaled(src: org.jetbrains.skia.Image, maxPx: Int): org.jetbrains.skia.Image {
+        try {
+            val scale = minOf(1f, maxPx.toFloat() / maxOf(src.width, src.height))
+            val w = maxOf(1, (src.width * scale).toInt()); val h = maxOf(1, (src.height * scale).toInt())
+            val surface = org.jetbrains.skia.Surface.makeRasterN32Premul(w, h)
+            surface.canvas.drawImageRect(
+                src, org.jetbrains.skia.Rect.makeWH(src.width.toFloat(), src.height.toFloat()), org.jetbrains.skia.Rect.makeWH(w.toFloat(), h.toFloat()),
+                org.jetbrains.skia.SamplingMode.MITCHELL, null, true,
+            )
+            return surface.makeImageSnapshot().also { surface.close() }
+        } finally { src.close() }
     }
 }
 
+/** Artwork sizes (longest side, pixels): tiles are ~150 dp wide, so 360 px stays sharp at 150 % display scaling. */
+const val TILE_PX = 360
+const val BLUR_PX = 160
+const val BACKDROP_PX = 1280
+
 @Composable
-fun RemoteImage(url: String?, modifier: Modifier = Modifier, placeholderText: String = "", contentScale: ContentScale = ContentScale.Crop, maxPx: Int = 600) {
+fun RemoteImage(url: String?, modifier: Modifier = Modifier, placeholderText: String = "", contentScale: ContentScale = ContentScale.Crop, maxPx: Int = TILE_PX) {
     var bmp by remember(url) { mutableStateOf<ImageBitmap?>(null) }
     val fetchable = !url.isNullOrBlank() && url.startsWith("http")
     var loading by remember(url) { mutableStateOf(fetchable) }

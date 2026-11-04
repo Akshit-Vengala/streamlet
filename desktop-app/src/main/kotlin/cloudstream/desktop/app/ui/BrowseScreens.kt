@@ -336,13 +336,13 @@ private fun Hero(c: AppController, featured: List<MediaCard>, provider: String?,
                 } else {
                     val d = details[cur.url]
                     val backdrop = d?.backdropUrl?.takeIf { it.isNotBlank() }
-                    if (backdrop != null) RemoteImage(backdrop, Modifier.fillMaxSize(), placeholderText = "", maxPx = 1920)
+                    if (backdrop != null) RemoteImage(backdrop, Modifier.fillMaxSize(), placeholderText = "", maxPx = BACKDROP_PX)
                     else {
-                        RemoteImage(cur.posterUrl, Modifier.fillMaxSize().blur(40.dp), placeholderText = "")
+                        RemoteImage(cur.posterUrl, Modifier.fillMaxSize().blur(40.dp), placeholderText = "", maxPx = BLUR_PX)
                         Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)))
                         // Sharp poster on the right when there is no landscape art.
                         RemoteImage(cur.posterUrl, Modifier.align(Alignment.CenterEnd).padding(end = 80.dp, top = 40.dp).width(270.dp).height(405.dp)
-                            .shadow(30.dp, RoundedCornerShape(8.dp)).clip(RoundedCornerShape(8.dp)), placeholderText = cur.name)
+                            .shadow(30.dp, RoundedCornerShape(8.dp)).clip(RoundedCornerShape(8.dp)), placeholderText = cur.name, maxPx = 600)
                     }
                     // Netflix-style scrims: left for legibility, bottom to melt into the page.
                     Box(Modifier.fillMaxHeight().fillMaxWidth(0.7f).background(Brush.horizontalGradient(listOf(Ink.copy(alpha = 0.95f), Ink.copy(alpha = 0.6f), Color.Transparent))))

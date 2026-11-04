@@ -74,7 +74,9 @@ import androidx.compose.ui.unit.sp
 import cloudstream.desktop.app.domain.SourceLink
 import cloudstream.desktop.app.domain.SubtitleItem
 import cloudstream.desktop.contracts.PlayerState
+import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import java.awt.Component
 import java.awt.Window
@@ -139,6 +141,17 @@ class PlayerUi {
 
     var onBack: () -> Unit = {}
     var onNext: () -> Unit = {}
+    var hasPrev by mutableStateOf(false)
+    /** Repeat the current file (VLC's L). */
+    var loop by mutableStateOf(false)
+    var onPrev: () -> Unit = {}
+    /** Temporary speed while a hold-for-2x lasts (not saved); null = back to [speed]. */
+    var onHoldSpeed: (Double?) -> Unit = {}
+    /** True while a hold-for-2x is active (shown as a badge). */
+    var holding by mutableStateOf(false)
+    var onQuit: () -> Unit = {}
+    var onStop: () -> Unit = {}
+    var onScreenshot: () -> Unit = {}
     /** Asks the player to flip pause. The UI calls [togglePlay], which also updates the icon at once. */
     var onPlayPause: () -> Unit = {}
 
@@ -249,7 +262,12 @@ fun groupSameNamed(entries: List<Pair<String, String>>): List<SubtitleGroup> {
 object PlayerKeys {
     /** (key, shift, alt, ctrl) of a key press -> handled. */
     @Volatile var handler: ((Key, Boolean, Boolean, Boolean) -> Boolean)? = null
+    /** A key release (Space: tap = pause, hold = 2x) -> handled. */
+    @Volatile var keyUp: ((Key) -> Boolean)? = null
 }
+
+private const val HOLD_SPEED = 2.0
+private const val HOLD_MS = 400L
 
 /** CloudStream-style player controls: top bar, centre transport, bottom seek bar + action row; auto-hide. */
 @OptIn(ExperimentalComposeUiApi::class)
@@ -267,16 +285,44 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
 
     // Keys come from the WINDOW (Main.kt), not from this box: focus moves to buttons/panels after clicks, and keys
     // then never reached a focus-based handler (arrows, Space "did nothing").
+    // Hold for 2x (YouTube / CloudStream): Space or the mouse held on the video plays at 2x until released.
+    // A quick Space tap still pauses, on release (so a hold is not also a pause).
+    var spaceDownAt by remember { mutableLongStateOf(0L) }
+    var mouseHoldEnded by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    fun startHold() { if (!ui.holding && ui.current != null) { ui.holding = true; ui.onHoldSpeed(HOLD_SPEED) } }
+    fun endHold() { if (ui.holding) { ui.holding = false; ui.onHoldSpeed(null) } }
+    LaunchedEffect(spaceDownAt) { if (spaceDownAt != 0L) { delay(HOLD_MS); if (spaceDownAt != 0L) startHold() } }
+    DisposableEffect(ui) { onDispose { endHold() } }
+    // Alt+Tab while holding: the key release never arrives, so the hold ends when the window loses focus.
+    val windowFocused = androidx.compose.ui.platform.LocalWindowInfo.current.isWindowFocused
+    LaunchedEffect(windowFocused) { if (!windowFocused) { spaceDownAt = 0L; endHold() } }
+
     DisposableEffect(ui) {
         val handler: (Key, Boolean, Boolean, Boolean) -> Boolean = handler@{ key, shift, alt, ctrl ->
             if (ui.extraDialog != null) return@handler false // a text field (online subtitle search) has the keys
             // Subtitle sync: its ms field takes digits and "-"; Esc cancels (handled by the dialog itself).
             if (dialog == "sync") return@handler if (key == Key.Escape) { ui.onSyncCancel?.invoke() ?: run { dialog = null }; true } else false
+            if (dialog == "goto") return@handler if (key == Key.Escape) { dialog = null; true } else false // its time field types
             poke()
+            if (key == Key.Spacebar && ui.current != null) {
+                if (spaceDownAt == 0L) spaceDownAt = System.currentTimeMillis() // auto-repeat while held: ignored
+                return@handler true
+            }
             handlePlayerKey(key, shift, alt, ctrl, ui, ui.seekBackMs, ui.seekForwardMs, onFlash = { flash = it }, onDialog = { dialog = it }, dialogOpen = dialog != null)
         }
+        val up: (Key) -> Boolean = up@{ key ->
+            if (key != Key.Spacebar || spaceDownAt == 0L) return@up false
+            spaceDownAt = 0L
+            if (ui.holding) endHold() else ui.togglePlay()
+            true
+        }
         PlayerKeys.handler = handler
-        onDispose { if (PlayerKeys.handler === handler) PlayerKeys.handler = null }
+        PlayerKeys.keyUp = up
+        onDispose {
+            if (PlayerKeys.handler === handler) PlayerKeys.handler = null
+            if (PlayerKeys.keyUp === up) PlayerKeys.keyUp = null
+        }
     }
     LaunchedEffect(Unit) { toasts.collect { snack.showSnackbar(it) } }
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
@@ -321,7 +367,17 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
             }
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { visible = !visible; lastActivity = System.currentTimeMillis() },
+                    onPress = {
+                        if (dialog != null || ui.extraDialog != null || ui.current == null) return@detectTapGestures
+                        val hold = scope.launch { delay(HOLD_MS); startHold() }
+                        tryAwaitRelease()
+                        hold.cancel()
+                        if (ui.holding) { endHold(); mouseHoldEnded = true } // a hold is not also a tap
+                    },
+                    onTap = {
+                        if (mouseHoldEnded) { mouseHoldEnded = false; return@detectTapGestures }
+                        visible = !visible; lastActivity = System.currentTimeMillis()
+                    },
                     onDoubleTap = { ui.onFullscreen() },
                 )
             },
@@ -401,10 +457,16 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
             Text(it, Modifier.align(Alignment.Center).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(0.7f)).padding(horizontal = 18.dp, vertical = 10.dp),
                 color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
         }
+        if (ui.holding) {
+            Text("2x  ▶▶", Modifier.align(Alignment.TopCenter).padding(top = 24.dp).clip(RoundedCornerShape(20.dp))
+                .background(Color.Black.copy(0.65f)).padding(horizontal = 16.dp, vertical = 6.dp),
+                color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+        }
 
         when (dialog) {
             "sources" -> SourcesDialog(ui) { dialog = null }
             "speed" -> SpeedDialog(ui) { dialog = null }
+            "goto" -> GotoTimeDialog(ui) { dialog = null }
             "sync" -> SyncSubsDialog(ui) { dialog = null }
             "keys" -> KeysDialog(ui) { dialog = null }
             "audio" -> AudioDialog(ui) { dialog = null }
@@ -473,52 +535,132 @@ private fun handlePlayerKey(
         val i = speeds.indexOfFirst { it >= ui.speed - 1e-6 }.let { if (it < 0) speeds.lastIndex else it }
         val s = speeds[(i + d).coerceIn(0, speeds.lastIndex)]; ui.onSpeed(s); onFlash("Speed ${s}x")
     }
+    fun fineSpeed(d: Double) {
+        val s = (Math.round((ui.speed + d) * 100) / 100.0).coerceIn(0.1, 4.0); ui.onSpeed(s); onFlash("Speed ${fmtSpeed(s)}x")
+    }
+    fun volume(d: Int) { ui.onVolume((ui.volume + d).coerceIn(0, 130)); onFlash("Volume ${ui.volume}%") }
     when (key) {
-        Key.Spacebar -> ui.togglePlay()
+        Key.Spacebar, Key.MediaPlayPause -> ui.togglePlay()
+        Key.MediaPlay -> if (!ui.state.playing) ui.togglePlay()
+        Key.MediaPause -> if (ui.state.playing) ui.togglePlay()
         Key.DirectionLeft -> seek(-jump(-1))
         Key.DirectionRight -> seek(jump(1))
-        Key.DirectionUp -> { ui.onVolume((ui.volume + 5).coerceAtMost(130)); onFlash("Volume ${ui.volume}%") }
-        Key.DirectionDown -> { ui.onVolume((ui.volume - 5).coerceAtLeast(0)); onFlash("Volume ${ui.volume}%") }
+        Key.DirectionUp -> volume(5)
+        Key.DirectionDown -> volume(-5)
         Key.M -> { ui.muted = !ui.muted; ui.onMpv(listOf("set", "mute", if (ui.muted) "yes" else "no")); onFlash(if (ui.muted) "Muted" else "Sound on") }
-        Key.F -> ui.onFullscreen()
+        Key.F, Key.F11 -> ui.onFullscreen()
         Key.Escape -> if (dialogOpen) onDialog(null) else if (ui.fullscreen) ui.onFullscreen() else ui.onBack()
-        Key.LeftBracket, Key.Minus, Key.NumPadSubtract -> speedStep(-1)
-        Key.RightBracket, Key.Plus, Key.NumPadAdd -> speedStep(1)
-        Key.Equals -> { ui.onSpeed(1.0); onFlash("Speed 1x") }
+        // VLC: - / + step through the preset speeds, [ / ] change it finely (0.1x), = back to normal.
+        Key.Minus, Key.NumPadSubtract -> speedStep(-1)
+        Key.Plus, Key.NumPadAdd -> speedStep(1)
+        Key.LeftBracket -> fineSpeed(-0.1)
+        Key.RightBracket -> fineSpeed(0.1)
+        Key.Equals -> if (shift) speedStep(1) /* "+" on the main row */ else { ui.onSpeed(1.0); onFlash("Speed 1x") }
         Key.E -> { ui.onMpv(listOf("frame-step")); onFlash("Next frame") }
-        Key.V -> { ui.onMpv(listOf("cycle", "sid")); onFlash("Subtitle track") }
-        Key.B -> { ui.onMpv(listOf("cycle", "aid")); onFlash("Audio track") }
+        Key.V -> { ui.onMpv(listOf("cycle", "sid", if (shift || alt) "down" else "up")); onFlash("Subtitle track") }
+        Key.B -> { ui.onMpv(listOf("cycle", "aid", if (shift || alt) "down" else "up")); onFlash("Audio track") }
+        Key.S -> when {
+            shift -> ui.onScreenshot()                 // VLC: Shift+S snapshot
+            ctrl || alt -> return false
+            else -> ui.onStop()                        // VLC: S stop
+        }
+        Key.MediaStop -> ui.onStop()
+        Key.P, Key.MediaPrevious -> if (ui.hasPrev) ui.onPrev() else onFlash("No previous episode")
+        Key.MediaNext -> if (ui.hasNext) ui.onNext()
+        Key.L -> { ui.loop = !ui.loop; ui.onMpv(listOf("set", "loop-file", if (ui.loop) "inf" else "no")); onFlash(if (ui.loop) "Repeat: on" else "Repeat: off") }
+        Key.PageUp -> { ui.onMpv(listOf("add", "chapter", "1")); onFlash("Next chapter") }
+        Key.PageDown -> { ui.onMpv(listOf("add", "chapter", "-1")); onFlash("Previous chapter") }
+        Key.Q -> if (ctrl) ui.onQuit() else return false
+        Key.W -> if (ctrl) ui.onBack() else return false
+        Key.MoveEnd -> if (ui.state.durationMs > 0) ui.onSeek((ui.state.durationMs - 5_000).coerceAtLeast(0))
+        Key.C, Key.Z -> { val m = if (key == Key.C) (if (ui.resizeMode == 1) 0 else 1) else (ui.resizeMode + 1) % 3; ui.onResize(m); onFlash(listOf("Fit", "Fill", "Stretch")[m]) }
         Key.G -> { ui.onSubDelay(ui.subDelay - 0.05); onFlash("Subtitle delay %+.0f ms".format(ui.subDelay * 1000)) }
         Key.H -> { ui.onSubDelay(ui.subDelay + 0.05); onFlash("Subtitle delay %+.0f ms".format(ui.subDelay * 1000)) }
         Key.J -> { ui.audioDelay -= 0.05; ui.onMpv(listOf("set", "audio-delay", "%.3f".format(java.util.Locale.ROOT, ui.audioDelay))); onFlash("Audio delay %+.0f ms".format(ui.audioDelay * 1000)) }
         Key.K -> { ui.audioDelay += 0.05; ui.onMpv(listOf("set", "audio-delay", "%.3f".format(java.util.Locale.ROOT, ui.audioDelay))); onFlash("Audio delay %+.0f ms".format(ui.audioDelay * 1000)) }
         Key.A -> { val m = (ui.resizeMode + 1) % 3; ui.onResize(m); onFlash(listOf("Fit", "Fill", "Stretch")[m]) }
-        Key.T -> onFlash("${fmtTime(ui.state.positionMs)} / ${fmtTime(ui.state.durationMs)}")
+        Key.T -> if (ctrl) onDialog("goto") /* VLC: Ctrl+T jump to time */ else onFlash("${fmtTime(ui.state.positionMs)} / ${fmtTime(ui.state.durationMs)}")
         Key.N -> if (ui.hasNext) ui.onNext()
         Key.MoveHome -> ui.onSeek(0)
         Key.F1 -> onDialog("keys")
         else -> {
             if (key == Key.Slash && shift) { onDialog("keys"); return true } // "?"
+            // 0-9: jump to 0 %, 10 % ... 90 % (as on YouTube; VLC leaves them unused).
+            val digit = digitKeys.indexOf(key).takeIf { it >= 0 }?.rem(10)
+            if (digit != null && !ctrl && !alt && ui.state.durationMs > 0) {
+                ui.onSeek(ui.state.durationMs * digit / 10); onFlash("${digit * 10} %"); return true
+            }
             return false
         }
     }
     return true
 }
 
+private val digitKeys = listOf(
+    Key.Zero, Key.One, Key.Two, Key.Three, Key.Four, Key.Five, Key.Six, Key.Seven, Key.Eight, Key.Nine,
+    Key.NumPad0, Key.NumPad1, Key.NumPad2, Key.NumPad3, Key.NumPad4, Key.NumPad5, Key.NumPad6, Key.NumPad7, Key.NumPad8, Key.NumPad9,
+)
+
+private fun fmtSpeed(s: Double): String = if (s == Math.floor(s)) s.toInt().toString() else "%.2f".format(java.util.Locale.ROOT, s).trimEnd('0')
+
 private fun fmtSpan(ms: Long): String = if (ms >= 60_000) "${ms / 60_000} min" else "${ms / 1000} s"
+
+/** "Ctrl+T" (VLC's Jump to time): type 1:23:45, 23:45 or 45 (seconds) and press Enter. */
+@Composable
+private fun GotoTimeDialog(ui: PlayerUi, onClose: () -> Unit) {
+    var text by remember { mutableStateOf(fmtTime(ui.state.positionMs)) }
+    val focus = remember { FocusRequester() }
+    fun parse(s: String): Long? {
+        val parts = s.trim().split(':').map { it.trim().toLongOrNull() ?: return null }
+        if (parts.isEmpty() || parts.size > 3) return null
+        return parts.fold(0L) { acc, p -> acc * 60 + p } * 1000
+    }
+    fun go() { parse(text)?.let { ms -> ui.onSeek(ms.coerceIn(0, ui.state.durationMs.takeIf { it > 0 } ?: ms)); onClose() } }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    OverlayPanel(onClose, 360, heightFraction = 0.32f) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+            Text("Jump to time", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Text("of ${fmtTime(ui.state.durationMs)}", color = Color(0xFF9A9AA2), fontSize = 13.sp)
+            Spacer(Modifier.height(14.dp))
+            androidx.compose.foundation.text.BasicTextField(
+                value = text,
+                onValueChange = { v -> text = v.filter { it.isDigit() || it == ':' }.take(9) },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 24.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center),
+                cursorBrush = androidx.compose.ui.graphics.SolidColor(Color.White),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { go() }),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                modifier = Modifier.width(200.dp).focusRequester(focus).padding(vertical = 6.dp)
+                    .onPreviewKeyEvent { e -> if (e.type == KeyEventType.KeyDown && (e.key == Key.Enter || e.key == Key.NumPadEnter)) { go(); true } else false },
+            )
+            Box(Modifier.width(200.dp).height(1.dp).background(Color(0xFFAAAAAA)))
+            Spacer(Modifier.height(14.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SyncAction("Go", primary = true) { go() }
+                SyncAction("Cancel") { onClose() }
+            }
+        }
+    }
+}
 
 /** The shortcut list (F1 or ?). */
 @Composable
 private fun KeysDialog(ui: PlayerUi, onClose: () -> Unit) {
     val rows = listOf(
-        "Space" to "Play / pause", "F, double-click" to "Full screen", "Esc" to "Close panel / leave full screen / back",
+        "Space" to "Play / pause (tap)", "Hold Space, hold mouse on video" to "2x while held",
+        "F, F11, double-click" to "Full screen", "Esc" to "Close panel / leave full screen / back",
         "Left / Right" to "Rewind / forward ${ui.seekBackMs / 1000} s / ${ui.seekForwardMs / 1000} s (Settings)",
         "Shift + Left / Right" to "3 s", "Alt + Left / Right" to "10 s", "Ctrl + Left / Right" to "1 min",
-        "Ctrl + Alt + Left / Right" to "5 min", "Up / Down, mouse wheel" to "Volume", "M" to "Mute",
-        "[ / ]  or  - / +" to "Slower / faster", "=" to "Normal speed", "E" to "Next frame",
-        "V" to "Next subtitle track", "B" to "Next audio track", "G / H" to "Subtitles 50 ms earlier / later",
-        "J / K" to "Audio 50 ms earlier / later", "A" to "Resize: fit / fill / stretch", "T" to "Show time",
-        "N" to "Next episode", "Home" to "Back to the start", "F1 or ?" to "This list",
+        "Ctrl + Alt + Left / Right" to "5 min", "Ctrl + T" to "Jump to time", "0 - 9" to "Jump to 0 % - 90 %",
+        "Home / End" to "Start / end", "Page Up / Down" to "Next / previous chapter",
+        "Up / Down, mouse wheel" to "Volume", "M" to "Mute",
+        "- / +" to "Slower / faster (steps)", "[ / ]" to "Slower / faster (0.1x)", "=" to "Normal speed",
+        "E" to "Next frame", "V / Shift+V" to "Next / previous subtitle track", "B / Shift+B" to "Next / previous audio track",
+        "G / H" to "Subtitles 50 ms earlier / later", "J / K" to "Audio 50 ms earlier / later",
+        "A, Z" to "Resize: fit / fill / stretch", "C" to "Crop (fill) on / off", "T" to "Show time",
+        "N / P" to "Next / previous episode", "L" to "Repeat on / off", "S" to "Stop (back to the title)",
+        "Shift + S" to "Snapshot (Pictures/Streamlet)", "Ctrl + W" to "Close the player", "Ctrl + Q" to "Quit",
+        "Media keys" to "Play/pause, stop, next, previous", "F1 or ?" to "This list",
     )
     OverlayPanel(onClose, 620) {
         Column {

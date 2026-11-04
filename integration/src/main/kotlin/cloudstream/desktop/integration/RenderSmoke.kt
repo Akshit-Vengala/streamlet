@@ -103,11 +103,11 @@ fun main(args: Array<String>) {
     Runtime.getRuntime().halt(rc)
 }
 
-private fun saveFrame(w: Int, h: Int, bgrx: ByteArray, file: File) {
+private fun saveFrame(w: Int, h: Int, rgbx: ByteArray, file: File) {
     val img = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
     for (y in 0 until h) for (x in 0 until w) {
         val i = (y * w + x) * 4
-        img.setRGB(x, y, ((bgrx[i + 2].toInt() and 0xFF) shl 16) or ((bgrx[i + 1].toInt() and 0xFF) shl 8) or (bgrx[i].toInt() and 0xFF))
+        img.setRGB(x, y, ((rgbx[i].toInt() and 0xFF) shl 16) or ((rgbx[i + 1].toInt() and 0xFF) shl 8) or (rgbx[i + 2].toInt() and 0xFF))
     }
     ImageIO.write(img, "png", file)
 }

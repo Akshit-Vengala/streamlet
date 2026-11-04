@@ -67,6 +67,21 @@ class PluginLoader(
     /** [cs3] is used as the plugin's `filename` (key for `sourcePlugin`), [jar] is the converted classes. */
     @Synchronized
     fun load(displayName: String, cs3: File, jar: File): LoadResult {
+        val t0 = System.nanoTime()
+        val r = loadUnlogged(displayName, cs3, jar)
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        when (r) {
+            is LoadResult.Ok -> log.info("Loaded extension ${r.name} in $ms ms: ${r.apis.size} provider(s)/extractor(s)")
+            is LoadResult.Failed -> log.warning("Extension ${r.name} not loaded" +
+                (if (r.blocked.isNotEmpty()) " (blocked by the safety check: ${r.blocked})" else "") +
+                ": ${r.error.take(500)}" + (if (r.missingClasses.isNotEmpty()) " missing=${r.missingClasses.take(10)}" else ""))
+        }
+        return r
+    }
+
+    private val log = java.util.logging.Logger.getLogger("streamlet.extensions")
+
+    private fun loadUnlogged(displayName: String, cs3: File, jar: File): LoadResult {
         val key = cs3.absolutePath
         if (loaded.containsKey(key)) unload(cs3)
         var cl: URLClassLoader? = null

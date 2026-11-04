@@ -37,14 +37,37 @@ object RealPlayShot {
         println("title: ${card.name} ${card.url}")
         c.goTo(Screen.Home); c.openDetails(card)
         val vm = c.detailsVm(card)
-        val scene = ImageComposeScene(1280, 720, Density(1f)) { AppRoot(c) }
+        // `--window`: a real on-screen window (GPU drawing, like the installed app), captured from the screen.
+        val window = if ("--window" in argv) {
+            var w: androidx.compose.ui.awt.ComposeWindow? = null
+            javax.swing.SwingUtilities.invokeAndWait {
+                w = androidx.compose.ui.awt.ComposeWindow().apply {
+                    setContent { AppRoot(c) }; setSize(1280, 760); setLocation(40, 40); isVisible = true
+                }
+            }
+            w
+        } else null
+        val scene = ImageComposeScene(1280, 720, Density(1f)) { if (window == null) AppRoot(c) }
         var t = 0L
-        fun frames(ms: Long) { val end = System.currentTimeMillis() + ms; while (System.currentTimeMillis() < end) { scene.render(t); t += 50_000_000L; Thread.sleep(50) } }
+        fun frames(ms: Long) {
+            if (window != null) { Thread.sleep(ms); return }
+            val end = System.currentTimeMillis() + ms; while (System.currentTimeMillis() < end) { scene.render(t); t += 50_000_000L; Thread.sleep(50) }
+        }
+        fun capture(f: File) {
+            if (window != null) {
+                val b = window.contentPane.let { java.awt.Rectangle(it.locationOnScreen, it.size) }
+                javax.imageio.ImageIO.write(java.awt.Robot().createScreenCapture(b), "png", f)
+            } else f.writeBytes(scene.render(t).encodeToData(EncodedImageFormat.PNG)!!.bytes)
+        }
         try {
             val loadEnd = System.currentTimeMillis() + 60_000
             while (vm.state.value.load is DetailsLoad.Loading && System.currentTimeMillis() < loadEnd) frames(200)
             println("details: ${vm.state.value.load::class.simpleName}")
-            val ep = vm.playTarget() ?: run { println("nothing to play"); return 2 }
+            val wantEp = arg("--episode")?.toInt(); val wantSeason = arg("--season")?.toInt()
+            val all = (vm.state.value.load as? DetailsLoad.Loaded)?.details?.episodes.orEmpty()
+            val ep = (if (wantEp != null) all.firstOrNull { it.episode == wantEp && (wantSeason == null || it.season == wantSeason) } else vm.playTarget())
+                ?: run { println("nothing to play (episodes: ${all.map { it.label }})"); return 2 }
+            println("episode: ${ep.label}")
             val t0 = System.currentTimeMillis()
             c.playEpisode(vm, ep)
             var n = 0
@@ -55,10 +78,14 @@ object RealPlayShot {
                 println("t=%3ds screen=%s lookup=%s links=%d playable=%d msg=%s".format(
                     (System.currentTimeMillis() - t0) / 1000, c.nav.current::class.simpleName, if (ls.loading) "running" else "done",
                     ls.links.size, ls.links.count { it.playable }, ls.message))
-                if (n % 3 == 1) File(out, "t%03d.png".format((System.currentTimeMillis() - t0) / 1000)).writeBytes(scene.render(t).encodeToData(EncodedImageFormat.PNG)!!.bytes)
+                cloudstream.desktop.app.ui.PlayerDebug.player?.let { m ->
+                    println("   subs offered=${ls.subtitles.size} tracks=" + m.subtitleTracks().joinToString { "${it.lang ?: it.title}${if (it.external) "(ext)" else ""}${if (it.selected) "*" else ""}" } +
+                        " sub-text=" + (m.property("sub-text")?.replace('\n', ' ')?.take(80) ?: "-") + " errors=${m.subtitleErrors.take(3)}")
+                }
+                if (n % 3 == 1) capture(File(out, "t%03d.png".format((System.currentTimeMillis() - t0) / 1000)))
                 if (pl == null) break
             }
-            fun shot(name: String) = File(out, "$name.png").writeBytes(scene.render(t).encodeToData(EncodedImageFormat.PNG)!!.bytes)
+            fun shot(name: String) = capture(File(out, "$name.png"))
             shot("final")
             // `--tour`: real clicks through the player's Source panel (and its ⚙ Priority), then the Settings screen.
             // Click positions come from -DsourceX/-DsourceY and -DgearX/-DgearY (read them off tour-1-controls.png).

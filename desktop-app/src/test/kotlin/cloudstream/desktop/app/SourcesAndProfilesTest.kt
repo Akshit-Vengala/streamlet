@@ -45,6 +45,15 @@ class SourceOrderTest {
         assertEquals(listOf("A 720", "X 1080"), out.map { it.name })
     }
 
+    @Test fun `playback speed is kept across restarts and clamped`() {
+        val kv = InMemoryKeyValueStore()
+        assertEquals(1.0, AppSettings(kv).playbackSpeed.value)
+        AppSettings(kv).setPlaybackSpeed(1.35)
+        assertEquals(1.35, AppSettings(kv).playbackSpeed.value)
+        AppSettings(kv).setPlaybackSpeed(9.0)
+        assertEquals(4.0, AppSettings(kv).playbackSpeed.value)
+    }
+
     @Test fun `moveSource ranks unranked names and reorders`() {
         val s = AppSettings(InMemoryKeyValueStore())
         s.moveSource("Server A", 0); s.moveSource("Server B", 0); s.moveSource("Server B", -1)

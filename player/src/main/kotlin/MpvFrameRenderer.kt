@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
  * All render-API calls happen on one dedicated thread, as libmpv requires.
  */
 class MpvFrameRenderer(private val api: MpvApi, mpv: Pointer) {
-    /** One finished frame: BGRx bytes (B, G, R, unused), [width] * 4 bytes per row. */
+    /** One finished frame: RGBx bytes (R, G, B, unused), [width] * 4 bytes per row. */
     class Frame(val width: Int, val height: Int, val bytes: ByteArray)
 
     private val ctx: Pointer
@@ -55,7 +55,8 @@ class MpvFrameRenderer(private val api: MpvApi, mpv: Pointer) {
     private fun loop() {
         var w = 0; var h = 0
         var pixels: Memory? = null
-        var sizeMem = Memory(8); val strideMem = Memory(8); val format = Memory(5).apply { setString(0, "bgr0", "US-ASCII") }
+        // rgb0 = Skia's RGB_888X: the 4th byte is padding Skia ignores (with BGRA it was read as alpha 0, see VideoSurface).
+        var sizeMem = Memory(8); val strideMem = Memory(8); val format = Memory(5).apply { setString(0, "rgb0", "US-ASCII") }
         var back: ByteArray? = null
         while (running) {
             try {

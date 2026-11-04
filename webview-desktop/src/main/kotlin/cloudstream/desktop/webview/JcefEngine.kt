@@ -314,6 +314,7 @@ class JcefEngine(private val runtime: JcefRuntime = JcefRuntime) : WebEngine {
         "Android" in ua -> "Linux armv81"
         "Windows" in ua -> "Win32"
         "Mac OS X" in ua -> "MacIntel"
+        "aarch64" in ua -> "Linux aarch64"
         else -> "Linux x86_64"
     }
 
@@ -335,7 +336,7 @@ class JcefEngine(private val runtime: JcefRuntime = JcefRuntime) : WebEngine {
             addProperty("platform", when { android -> "Android"; "Windows" in ua -> "Windows"; "Mac OS X" in ua -> "macOS"; else -> "Linux" })
             addProperty("platformVersion", Regex("""Android (\d+(?:\.\d+)*)""").find(ua)?.groupValues?.get(1)?.let { "$it.0.0".split('.').take(3).joinToString(".") }
                 ?: if ("Windows" in ua) "10.0.0" else "")
-            addProperty("architecture", if (android) "" else "x86")
+            addProperty("architecture", if (android) "" else if ("aarch64" in ua || "arm" in System.getProperty("os.arch").orEmpty().lowercase()) "arm" else "x86")
             addProperty("model", if (android) Regex("""Android [^;)]*; ([^;)]+)""").find(ua)?.groupValues?.get(1)?.trim().orEmpty() else "")
             addProperty("mobile", "Mobile" in ua)
             addProperty("bitness", if (android) "" else "64")

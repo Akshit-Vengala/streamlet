@@ -62,6 +62,14 @@ private class PlayerSession(
     /** null while the loading screen is up (no source chosen yet). */
     @Volatile var current: SourceLink? = req.link
     @Volatile var lastState = PlayerState(0, 0, false, false, null)
+    /** Where the open source was asked to start, and whether it has played since (then its position is real). */
+    @Volatile private var wantedMs = req.startMs
+    @Volatile private var playedSinceOpen = false
+    /**
+     * Where another source should continue: the current one's position once it has played, else where it was asked
+     * to start, so a resume point survives sources that fail before playing (they report position 0).
+     */
+    fun resumePoint(): Long = if (playedSinceOpen) lastState.positionMs.coerceAtLeast(0) else wantedMs
     private val failed = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
     /** Reopen attempts of the current source (reset whenever another source is opened). */
     @Volatile private var reopens = 0
@@ -123,6 +131,9 @@ private class PlayerSession(
 
     /** Opens [link] in the player right now, at [startMs]. */
     fun open(link: SourceLink, startMs: Long) {
+        cloudstream.desktop.app.AppLog.get("player").info("Playing \"${req.card.name}\" from ${link.source} / ${link.name} " +
+            "(${link.qualityLabel}) ${cloudstream.desktop.app.redactUrl(link.url)} at ${startMs / 1000} s")
+        wantedMs = startMs; playedSinceOpen = false
         current = link
         generation++
         ui.current = link
@@ -144,7 +155,7 @@ private class PlayerSession(
         if (cur == null) { open(l, req.startMs); return }
         if (l.url == cur.url) return
         reopens = 0
-        open(l, lastState.positionMs.coerceAtLeast(0))
+        open(l, resumePoint())
     }
 
     /**
@@ -154,7 +165,7 @@ private class PlayerSession(
     fun userPick(l: SourceLink) {
         failed -= l.url
         ui.failed = failed.toSet()
-        if (current?.url == l.url) { reopens = 0; open(l, lastState.positionMs.coerceAtLeast(0)); return }
+        if (current?.url == l.url) { reopens = 0; open(l, resumePoint()); return }
         switchTo(l)
     }
 
@@ -165,13 +176,27 @@ private class PlayerSession(
         ui.hasNext = next != null
         ui.onBack = { c.back() }
         ui.onNext = { if (next != null) { c.back(); c.playEpisode(dm, next) } }
+        val prev = dm.visibleEpisodes().let { l -> l.indexOfFirst { it.data == req.episode.data }.takeIf { it > 0 }?.let { l[it - 1] } }
+        ui.hasPrev = prev != null
+        ui.onPrev = { if (prev != null) { c.back(); c.playEpisode(dm, prev) } }
         ui.onFullscreen = { c.fullscreen.value = !c.fullscreen.value }
         // mpv's own pause flag ("playing" reads false while buffering, so it must not decide).
         // mpv's own pause flag ("playing" reads false while buffering, so it must not decide).
         ui.onPlayPause = { mpv?.togglePause() ?: run { if (h.player.state.value.playing) h.player.pause() else h.player.play() } }
         ui.onSeek = { h.player.seek(it.coerceAtLeast(0)) }
         ui.onSeekBy = { d -> mpv?.seekBy(d) ?: h.player.seek((h.player.state.value.positionMs + d).coerceAtLeast(0)) }
-        ui.onSpeed = { ui.speed = it; dp?.setSpeed(it) }
+        // The speed the user sets is kept (next episode, restarts); hold-for-2x is temporary and never saved.
+        ui.onSpeed = { ui.speed = it; dp?.setSpeed(it); settings.setPlaybackSpeed(it) }
+        ui.onHoldSpeed = { s -> dp?.setSpeed(s ?: ui.speed) }
+        ui.speed = settings.playbackSpeed.value
+        if (ui.speed != 1.0) dp?.setSpeed(ui.speed)
+        ui.onQuit = { c.services.close(); kotlin.system.exitProcess(0) }
+        ui.onStop = { c.back() }
+        ui.onScreenshot = {
+            val dir = java.io.File(System.getProperty("user.home"), "Pictures/Streamlet").apply { mkdirs() }
+            val f = java.io.File(dir, "streamlet-" + java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".png")
+            if (mpv?.screenshotTo(f) == true) c.services.toast("Snapshot saved: ${f.absolutePath}") else c.services.toast("Snapshot failed")
+        }
         ui.onVolume = { ui.volume = it; dp?.setVolume(it) }
         ui.onResize = { mode ->
             ui.resizeMode = mode
@@ -238,11 +263,13 @@ private class PlayerSession(
 
     /** All long-running work of the session; cancelled when the player screen goes away. */
     suspend fun run() = coroutineScope {
+        PlayerDebug.player = mpv
         // Player state -> overlay (no recomposition of the main window involved).
         launch {
             var synced = false
             h.player.state.collect { st ->
                 lastState = st; ui.applyPlayerState(st)
+                if (st.playing && st.positionMs > 0) playedSinceOpen = true
                 // Tracking: once ~90% watched, raise progress on signed-in trackers (once per play).
                 if (!synced && st.durationMs > 60_000 && st.positionMs >= st.durationMs * 9 / 10) {
                     synced = true
@@ -357,6 +384,9 @@ private class PlayerSession(
     }
 }
 
+/** The open player's libmpv instance, for diagnostics (RealPlayShot). */
+object PlayerDebug { @Volatile var player: cloudstream.desktop.player.LibMpvPlayer? = null }
+
 @Composable
 fun PlayerScreen(c: AppController, req: PlayRequest) {
     var handle by remember(req) { mutableStateOf<PlayerHandle?>(null) }
@@ -367,8 +397,14 @@ fun PlayerScreen(c: AppController, req: PlayRequest) {
 
     // Create the player off the UI thread (loads native libs).
     LaunchedEffect(req) {
-        try { handle = withContext(Dispatchers.IO) { c.services.players.create(settings.playerChoice.value) } }
-        catch (t: Throwable) { failure = "${t::class.simpleName}: ${t.message}" }
+        val log = cloudstream.desktop.app.AppLog.get("player")
+        try {
+            handle = withContext(Dispatchers.IO) { c.services.players.create(settings.playerChoice.value) }
+            handle?.let { log.info("Player for \"${req.card.name}\": ${it.description} (real=${it.real}, embedded=${it.embeddable})") }
+        } catch (t: Throwable) {
+            log.log(java.util.logging.Level.WARNING, "Could not start the player", t)
+            failure = "${t::class.simpleName}: ${t.message}"
+        }
     }
     val h = handle
     val session = remember(h) { h?.let { PlayerSession(c, req, dm, it, ui).also { s -> s.wireActions() } } }
@@ -378,6 +414,7 @@ fun PlayerScreen(c: AppController, req: PlayRequest) {
     DisposableEffect(session) {
         onDispose {
             session?.let { if (it.lastState.positionMs > 0) saveResume(c, req, it.lastState) }
+            if (PlayerDebug.player === h?.player) PlayerDebug.player = null
             h?.release()
             c.fullscreen.value = false
         }

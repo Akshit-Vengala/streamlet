@@ -25,7 +25,12 @@ class AppUpdaterTest {
     @Test fun `the installer for this OS is picked from the release assets`() {
         val assets = listOf("App-1.0.1.deb", "App-1.0.1.exe", "App-1.0.1.msi", "App-1.0.1-x86_64.AppImage", "checksums.txt")
         assertEquals("App-1.0.1.msi", pickInstaller(assets, windows = true, arch = "amd64"))
-        assertEquals("App-1.0.1-x86_64.AppImage", pickInstaller(assets, windows = false, arch = "amd64"))
+        assertEquals("App-1.0.1-x86_64.AppImage", pickInstaller(assets, windows = false, arch = "amd64", linuxPackage = null))
+        // Linux: the system's own package type wins (a .deb can't be installed on Fedora).
+        val linux = listOf("Streamlet-1.0.1.deb", "Streamlet-1.0.1-1.x86_64.rpm")
+        assertEquals("Streamlet-1.0.1.deb", pickInstaller(linux, windows = false, arch = "amd64", linuxPackage = ".deb"))
+        assertEquals("Streamlet-1.0.1-1.x86_64.rpm", pickInstaller(linux, windows = false, arch = "amd64", linuxPackage = ".rpm"))
+        assertEquals("Streamlet-1.0.1.deb", pickInstaller(listOf("Streamlet-1.0.1.deb"), windows = false, arch = "amd64", linuxPackage = ".rpm"))
         assertEquals("App.exe", pickInstaller(listOf("App.exe"), windows = true, arch = "amd64"))
         assertNull(pickInstaller(listOf("source.zip"), windows = true, arch = "amd64"))
         // Another CPU's build is never picked; this CPU's wins over a neutral name.

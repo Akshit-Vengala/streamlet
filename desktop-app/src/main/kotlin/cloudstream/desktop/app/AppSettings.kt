@@ -67,6 +67,11 @@ class AppSettings(
     fun setSeekBackSeconds(s: Int) { _seekBack.value = s; kv.set("ui/seekBackSec", s) }
     fun setSeekForwardSeconds(s: Int) { _seekForward.value = s; kv.set("ui/seekForwardSec", s) }
 
+    private val _speed = MutableStateFlow(kv.get("ui/playbackSpeed", Double::class.javaObjectType)?.takeIf { it in 0.1..4.0 } ?: 1.0)
+    /** Playback speed: kept from the last time the user set it (panel, keys), across episodes and restarts. */
+    val playbackSpeed: StateFlow<Double> = _speed.asStateFlow()
+    fun setPlaybackSpeed(s: Double) { val v = s.coerceIn(0.1, 4.0); _speed.value = v; kv.set("ui/playbackSpeed", v) }
+
     private val _extUpdates = MutableStateFlow(str("extUpdates")?.let { n -> ExtUpdateMode.entries.firstOrNull { it.name == n } } ?: ExtUpdateMode.Auto)
     /** Extension updates (machine-wide; read from the default profile's settings). */
     val extUpdates: StateFlow<ExtUpdateMode> = _extUpdates.asStateFlow()

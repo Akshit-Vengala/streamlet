@@ -25,6 +25,15 @@ class WebViewUserAgentTest {
         }
     }
 
+    @Test fun `the engine reports the OS it runs on, and another OS's claim is refused`() {
+        val os = System.getProperty("os.name").lowercase()
+        val expected = when { os.startsWith("windows") -> "Windows NT"; os.contains("mac") -> "Mac OS X"; else -> "X11; Linux" }
+        kotlin.test.assertTrue(expected in engine, engine)
+        // Same Chrome version, other OS (Windows on Linux or the other way round): Cloudflare would catch it.
+        val other = engine.replace(WebSettings.osToken(), if ("Windows" in engine) "X11; Linux x86_64" else "Windows NT 10.0; Win64; x64")
+        assertEquals(engine, WebSettings().apply { userAgentString = other }.userAgentString)
+    }
+
     @Test fun `a consistent custom user agent is kept, null restores the default`() {
         val same = engine.replace("143.0.0.0", "143.0.7499.193")
         val s = WebSettings().apply { userAgentString = same }

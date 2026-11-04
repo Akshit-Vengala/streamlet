@@ -127,9 +127,9 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
 @Composable
 private fun Backdrop(backdropUrl: String?, posterUrl: String?, height: androidx.compose.ui.unit.Dp? = null) {
     Box((if (height != null) Modifier.fillMaxWidth().height(height) else Modifier.fillMaxSize())) {
-        if (!backdropUrl.isNullOrBlank()) RemoteImage(backdropUrl, Modifier.fillMaxSize(), placeholderText = "", maxPx = 1920)
+        if (!backdropUrl.isNullOrBlank()) RemoteImage(backdropUrl, Modifier.fillMaxSize(), placeholderText = "", maxPx = BACKDROP_PX)
         else {
-            RemoteImage(posterUrl, Modifier.fillMaxSize().blur(44.dp), placeholderText = "")
+            RemoteImage(posterUrl, Modifier.fillMaxSize().blur(44.dp), placeholderText = "", maxPx = BLUR_PX)
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.4f)))
         }
         Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(listOf(Ink.copy(alpha = 0.96f), Ink.copy(alpha = 0.55f), Color.Transparent), endX = 1400f)))
@@ -144,7 +144,7 @@ private fun Header(c: AppController, d: MediaDetails, vm: DetailsViewModel, s: c
         Backdrop(d.backdropUrl, d.posterUrl ?: vm.card.posterUrl, 560.dp)
         if (d.backdropUrl.isNullOrBlank()) RemoteImage(
             d.posterUrl ?: vm.card.posterUrl, Modifier.align(Alignment.CenterEnd).padding(end = 80.dp, top = 50.dp).width(260.dp).height(390.dp)
-                .shadow(30.dp, RoundedCornerShape(8.dp)).clip(RoundedCornerShape(8.dp)), placeholderText = d.name,
+                .shadow(30.dp, RoundedCornerShape(8.dp)).clip(RoundedCornerShape(8.dp)), placeholderText = d.name, maxPx = 600,
         )
         Column(Modifier.align(Alignment.BottomStart).padding(start = 48.dp, bottom = 36.dp).width(680.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(vm.card.provider.uppercase(), color = Accent, fontWeight = FontWeight.Black, letterSpacing = 3.sp, style = MaterialTheme.typography.labelLarge)
