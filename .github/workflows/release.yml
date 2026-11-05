@@ -69,5 +69,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -la dist
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Streamlet $GITHUB_REF_NAME" --generate-notes
+          # The artifacts keep their msi/ deb/ rpm/ folders: upload the files inside them.
+          mapfile -t files < <(find dist -type f \( -name '*.msi' -o -name '*.deb' -o -name '*.rpm' \))
+          printf '%s
+' "${files[@]}"
+          test ${#files[@]} -gt 0
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --title "Streamlet $GITHUB_REF_NAME" --generate-notes
