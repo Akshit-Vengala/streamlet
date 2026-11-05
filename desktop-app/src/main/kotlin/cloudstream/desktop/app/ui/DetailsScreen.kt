@@ -107,7 +107,10 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
                         itemsIndexed(episodes, key = { _, it -> it.data }) { i, ep ->
                             val rp = s.progress[ep.data]
                             val watched = rp?.watched == true
-                            val frac = if (watched) 1f else rp?.takeIf { it.durationMs > 0 && it.positionMs > 0 }?.let { it.positionMs.toFloat() / it.durationMs }
+                            // Progress bar on the thumbnail: how far it was watched; a watched one with no position
+                            // (marked by hand, or finished in 1.0.0) shows full.
+                            val frac = rp?.takeIf { it.durationMs > 1 && it.positionMs > 0 }?.let { it.positionMs.toFloat() / it.durationMs }
+                                ?: if (watched) 1f else null
                             val dlId = episodeId(vm.card.provider, ep.data)
                             val dl = downloads.firstOrNull { it.id == dlId }
                             EpisodeRow(i + 1, ep, d.posterUrl, frac, watched, dl, onPlay = { c.playEpisode(vm, ep) }, onDownload = {

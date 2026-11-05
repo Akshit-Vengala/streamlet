@@ -24,6 +24,8 @@ class EpisodeFlowTest {
         assertEquals(0, ResumePoint("e", 23 * min, 24 * min, 0).startMs)
         assertEquals(10 * min, ResumePoint("e", 10 * min, 24 * min, 0).startMs)
         assertTrue(ResumePoint.markedWatched("e", 0).watched)
+        assertTrue(ResumePoint("e", 0, 24 * min, 0).watched, "finished in 1.0.0 (saved as position 0)")
+        assertEquals(0, ResumePoint("e", 0, 24 * min, 0).startMs)
         assertFalse(ResumePoint.cleared("e", 0).watched)
     }
 

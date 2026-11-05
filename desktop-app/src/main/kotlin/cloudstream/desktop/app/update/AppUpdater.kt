@@ -140,6 +140,10 @@ class AppUpdater(
     /** Checks now; [onNewer] is called when a newer release exists. */
     fun check(onNewer: (AppRelease) -> Unit = {}): Job? {
         if (!configured || job?.isActive == true) return job
+        // A download under way or finished stays as it is: a check (e.g. the automatic one 20 s after start-up) used
+        // to put "Download and install" back over "Install" the moment a download had finished.
+        val before = _state.value
+        if (before is UpdateState.Downloading || before is UpdateState.Ready) return null
         _state.value = UpdateState.Checking
         return scope.launch {
             _state.value = try {
@@ -172,6 +176,11 @@ class AppUpdater(
     fun download(rel: AppRelease): Job? {
         val url = rel.assetUrl ?: run { _state.value = UpdateState.Failed("This release has no installer for your system", rel); return null }
         if (job?.isActive == true) return job
+        // Already downloaded (same file, full size): no second download.
+        File(downloadDir, rel.assetName ?: "update").takeIf { rel.assetSize > 0 && it.isFile && it.length() == rel.assetSize }?.let {
+            _state.value = UpdateState.Ready(rel, it)
+            return null
+        }
         _state.value = UpdateState.Downloading(rel, 0f)
         return scope.launch {
             _state.value = try {

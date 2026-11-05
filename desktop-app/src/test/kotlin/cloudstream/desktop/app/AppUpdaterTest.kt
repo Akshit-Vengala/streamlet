@@ -40,6 +40,19 @@ class AppUpdaterTest {
         assertNull(pickInstaller(listOf("App-arm64.msi"), windows = true, arch = "amd64"))
     }
 
+    @Test fun `a finished download stays ready when the automatic check runs`() {
+        val dir = java.nio.file.Files.createTempDirectory("upd").toFile()
+        try {
+            val msi = java.io.File(dir, "Streamlet-1.0.1.msi").apply { writeBytes(ByteArray(1234)) }
+            val u = AppUpdater(CoroutineScope(Dispatchers.Unconfined), repo = "owner/name", current = "1.0.0", downloadDir = dir)
+            val rel = cloudstream.desktop.app.update.AppRelease("1.0.1", "v1.0.1", "", "https://x", "https://x/Streamlet-1.0.1.msi", msi.name, msi.length())
+            assertNull(u.download(rel), "already on disk at full size: no second download")
+            assertTrue(u.state.value is UpdateState.Ready)
+            assertNull(u.check(), "a check does not replace a downloaded update")
+            assertEquals(msi, (u.state.value as UpdateState.Ready).file)
+        } finally { dir.deleteRecursively() }
+    }
+
     @Test fun `without a release repository the updater is off`() {
         val u = AppUpdater(CoroutineScope(Dispatchers.Unconfined), repo = "", current = "1.0.0")
         assertFalse(u.configured)

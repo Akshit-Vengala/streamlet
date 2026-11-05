@@ -38,8 +38,12 @@ data class Bookmark(
     val status: WatchStatus = WatchStatus.PlanToWatch,
 )
 data class ResumePoint(val id: String, val positionMs: Long, val durationMs: Long, val updatedAt: Long) {
-    /** Watched to the end (credits count): see [isWatchedAt]. Manually marked episodes are stored as 1 / 1. */
-    val watched: Boolean get() = isWatchedAt(positionMs, durationMs)
+    /**
+     * Watched to the end (credits count): see [isWatchedAt]. Manually marked episodes are stored as 1 / 1. Version
+     * 1.0.0 stored a finished episode as position 0 with its duration (unfinished ones are only saved once playing,
+     * so position > 0): that reads as watched too.
+     */
+    val watched: Boolean get() = isWatchedAt(positionMs, durationMs) || (positionMs == 0L && durationMs > 0)
     /** Where to start playing: the saved position, or the beginning once watched. */
     val startMs: Long get() = if (watched) 0 else positionMs.coerceAtLeast(0)
 
