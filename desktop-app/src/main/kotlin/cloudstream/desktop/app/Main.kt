@@ -4,6 +4,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.input.key.Key
@@ -104,6 +105,14 @@ fun main(argv: Array<String>) {
     else AppServices.real(AppServices.appRoot(args.dataDir))
     val controller = AppController(services)
     AppLog.get("app").info("Services ready (${services.mode})")
+    // DNS over HTTPS for the extensions' HTTP client: now, and whenever it is changed in Settings.
+    if (services.mode == AppServices.Mode.Real) services.scope.launch {
+        services.globalSettings.dnsProvider.collect { p ->
+            runCatching { cloudstream.desktop.webview.NetworkDns.apply(p) }
+                .onSuccess { AppLog.get("network").info("DNS: ${p.label}") }
+                .onFailure { AppLog.get("network").warning("DNS ${p.label} not applied: $it") }
+        }
+    }
     AppLog.startFreezeWatch()
     if (!args.fakes) Thread({ runCatching { DiskCleanup.run() }.onFailure { AppLog.get("cleanup").warning("Cleanup failed: $it") } }, "disk-cleanup")
         .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
@@ -187,6 +196,8 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
                 if (fs && saved == null) {
                     saved = w.bounds to w.extendedState
                     w.extendedState = java.awt.Frame.NORMAL
+                    // Windows: no caption, monitor-sized, marked full-screen for the taskbar (else it stays on top).
+                    if (cloudstream.desktop.contracts.Os.isWindows && WinFullscreen.enter(w)) { w.toFront(); return@collect }
                     val screen = w.graphicsConfiguration.bounds
                     val ins = w.insets
                     // Title bar and borders just outside the screen; the client area covers the whole monitor.
@@ -196,6 +207,7 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
                 } else if (!fs && saved != null) {
                     val (b, st) = saved!!
                     saved = null
+                    if (cloudstream.desktop.contracts.Os.isWindows) WinFullscreen.exit(w)
                     w.bounds = b
                     w.extendedState = st
                 }

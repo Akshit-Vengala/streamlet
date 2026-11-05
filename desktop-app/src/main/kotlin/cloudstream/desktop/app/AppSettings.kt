@@ -64,6 +64,30 @@ class AppSettings(
     /** Player rewind / fast-forward step in seconds (buttons and arrow keys). */
     val seekBackSeconds: StateFlow<Int> = _seekBack.asStateFlow()
     val seekForwardSeconds: StateFlow<Int> = _seekForward.asStateFlow()
+    private val _autoNext = MutableStateFlow(kv.get("ui/autoNext", Boolean::class.javaObjectType) ?: true)
+    /** At the end of an episode, play the next one after a short countdown. */
+    val autoNextEpisode: StateFlow<Boolean> = _autoNext.asStateFlow()
+    fun setAutoNextEpisode(b: Boolean) { _autoNext.value = b; kv.set("ui/autoNext", b) }
+    private val _autoSkip = MutableStateFlow(kv.get("ui/autoSkipIntro", Boolean::class.javaObjectType) ?: false)
+    /** Skip intros / recaps without asking (the button still shows for credits). */
+    val autoSkipIntro: StateFlow<Boolean> = _autoSkip.asStateFlow()
+    fun setAutoSkipIntro(b: Boolean) { _autoSkip.value = b; kv.set("ui/autoSkipIntro", b) }
+
+    private val _downloadDir = MutableStateFlow(str("downloadDir"))
+    /** Where downloads go (machine-wide: read it from the global settings); null = [defaultDownloadDir]. */
+    val downloadDir: StateFlow<String?> = _downloadDir.asStateFlow()
+    fun setDownloadDir(path: String?) { _downloadDir.value = path; if (path == null) kv.remove("ui/downloadDir") else kv.set("ui/downloadDir", path) }
+    fun downloadFolder(): java.io.File = _downloadDir.value?.let { java.io.File(it) } ?: defaultDownloadDir()
+    private val _maxDownloads = MutableStateFlow(int("maxDownloads") ?: 3)
+    /** Downloads running at the same time. */
+    val maxDownloads: StateFlow<Int> = _maxDownloads.asStateFlow()
+    fun setMaxDownloads(n: Int) { _maxDownloads.value = n; kv.set("ui/maxDownloads", n) }
+
+    private val _dns = MutableStateFlow(str("dnsProvider")?.let { n -> cloudstream.desktop.webview.DohProvider.entries.firstOrNull { it.name == n } } ?: cloudstream.desktop.webview.DohProvider.None)
+    /** CloudStream's "DNS over HTTPS" (machine-wide: read it from the global settings). */
+    val dnsProvider: StateFlow<cloudstream.desktop.webview.DohProvider> = _dns.asStateFlow()
+    fun setDnsProvider(p: cloudstream.desktop.webview.DohProvider) { _dns.value = p; kv.set("ui/dnsProvider", p.name) }
+
     fun setSeekBackSeconds(s: Int) { _seekBack.value = s; kv.set("ui/seekBackSec", s) }
     fun setSeekForwardSeconds(s: Int) { _seekForward.value = s; kv.set("ui/seekForwardSec", s) }
 
@@ -162,8 +186,24 @@ class AppSettings(
 }
 
 /** A hidden entry matches a whole source ("Source") or one of its servers by link name ("Source [Server 1]"). */
-fun isHiddenSource(l: cloudstream.desktop.app.domain.SourceLink, hidden: Set<String>): Boolean =
-    hidden.any { it.equals(l.source, true) || (l.name.isNotBlank() && it.equals(l.name, true)) }
+fun isHiddenSource(l: cloudstream.desktop.app.domain.SourceLink, hidden: Set<String>): Boolean {
+    val key = serverKey(l.name)
+    return hidden.any { it.equals(l.source, true) || (key.isNotBlank() && serverKey(it).equals(key, true)) }
+}
+
+/**
+ * A server's stable name: link names carry per-episode / per-quality details after " - " inside the brackets
+ * ("Mirror [North - 1080p]", "Mirror [South - S01E01 Direct MP4 - 1080p]"), so hiding one by its full
+ * name stopped matching on the next episode or quality. Both become "Mirror [North]" / "Mirror [South]".
+ */
+fun serverKey(name: String): String {
+    val n = name.trim()
+    val open = n.indexOf('[')
+    val close = n.lastIndexOf(']')
+    if (open < 0 || close <= open) return n
+    val inner = n.substring(open + 1, close).substringBefore(" - ").trim()
+    return if (inner.isEmpty()) n else n.substring(0, open).trimEnd() + " [" + inner + "]"
+}
 
 /**
  * Play order: drop [hidden] sources (see [isHiddenSource], case-insensitive), then sort by position in
@@ -204,4 +244,11 @@ fun <T> pickBest(items: List<T>, preferred: Int, quality: (T) -> Int): T? {
     if (preferred == 0) return items.maxByOrNull { q(it) }
     val atOrBelow = items.filter { q(it) <= preferred }
     return atOrBelow.maxByOrNull { q(it) } ?: items.minByOrNull { q(it) }
+}
+
+/** The user's Videos folder (Streamlet sub-folder), else the home folder. */
+fun defaultDownloadDir(): java.io.File {
+    val home = java.io.File(System.getProperty("user.home"))
+    val videos = listOf("Videos", "Movies").map { java.io.File(home, it) }.firstOrNull { it.isDirectory } ?: home
+    return java.io.File(videos, "Streamlet")
 }

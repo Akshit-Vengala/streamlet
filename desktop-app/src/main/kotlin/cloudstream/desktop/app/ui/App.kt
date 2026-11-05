@@ -106,6 +106,7 @@ private val navItems = listOf(
     NavItem(Screen.Home, "Home"),
     NavItem(Screen.Search, "Search"),
     NavItem(Screen.Library, "My List"),
+    NavItem(Screen.Downloads, "Downloads"),
     NavItem(Screen.Extensions, "Extensions"),
     NavItem(Screen.Settings, "Settings"),
 )
@@ -129,6 +130,7 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
                         Screen.Home -> HomeScreen(c)
                         Screen.Search -> SearchScreen(c, searchFocus)
                         Screen.Library -> LibraryScreen(c)
+                        Screen.Downloads -> DownloadsScreen(c)
                         Screen.Extensions -> ExtensionsScreen(c)
                         Screen.Settings -> SettingsScreen(c)
                         is Screen.Details -> DetailsScreen(c, c.detailsVm(s.card))

@@ -37,7 +37,29 @@ data class Bookmark(
     /** Older "My List" entries had no status: they read as Plan to Watch. */
     val status: WatchStatus = WatchStatus.PlanToWatch,
 )
-data class ResumePoint(val id: String, val positionMs: Long, val durationMs: Long, val updatedAt: Long)
+data class ResumePoint(val id: String, val positionMs: Long, val durationMs: Long, val updatedAt: Long) {
+    /** Watched to the end (credits count): see [isWatchedAt]. Manually marked episodes are stored as 1 / 1. */
+    val watched: Boolean get() = isWatchedAt(positionMs, durationMs)
+    /** Where to start playing: the saved position, or the beginning once watched. */
+    val startMs: Long get() = if (watched) 0 else positionMs.coerceAtLeast(0)
+
+    companion object {
+        /** A watched point for an episode marked by hand (duration unknown). */
+        fun markedWatched(id: String, now: Long) = ResumePoint(id, 1, 1, now)
+        /** Cleared: no progress, not watched. */
+        fun cleared(id: String, now: Long) = ResumePoint(id, 0, 0, now)
+    }
+}
+
+/**
+ * Watched once only the credits can be left: the last 5%, or the last min(10%, 4 min) when that is longer (a 24 min
+ * episode: last 2.4 min; 45 min: last 4 min; a 2 h film: last 6 min).
+ */
+fun isWatchedAt(positionMs: Long, durationMs: Long): Boolean {
+    if (durationMs <= 0 || positionMs <= 0) return false
+    val tail = maxOf(durationMs / 20, minOf(durationMs / 10, 240_000L))
+    return positionMs >= durationMs - tail
+}
 data class HistoryEntry(
     val id: String, val name: String, val apiName: String, val url: String,
     val posterUrl: String?, val episode: Int?, val season: Int?, val watchedAt: Long,

@@ -7,6 +7,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     // upstream `library` keeps these as `implementation`, so declare them here; versions match upstream's catalog.
     implementation("com.squareup.okhttp3:okhttp:5.3.2")
+    implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:5.3.2") // CloudStream's DNS over HTTPS setting (NetworkDns)
     implementation("com.github.Blatzar:NiceHttp:0.4.18")
     // Pinned: CEF 143 / Chromium 143. Natives are downloaded on first run (see JcefRuntime).
     implementation("me.friwi:jcefmaven:143.0.14")

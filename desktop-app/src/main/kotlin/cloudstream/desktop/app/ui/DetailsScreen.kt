@@ -61,6 +61,10 @@ import cloudstream.desktop.app.vm.episodeId
 @Composable
 fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
     val s by vm.state.collectAsStateCompat()
+    // Back from the player (or another screen): progress may have changed.
+    androidx.compose.runtime.LaunchedEffect(vm) { vm.refreshProgress() }
+    val downloads by c.services.downloads.items.collectAsStateCompat()
+    var downloadFor by remember { mutableStateOf<EpisodeItem?>(null) }
 
     Box(Modifier.fillMaxSize()) {
         when (val l = s.load) {
@@ -101,9 +105,35 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
                             }
                         }
                         itemsIndexed(episodes, key = { _, it -> it.data }) { i, ep ->
-                            val rp = c.services.library.resume(episodeId(vm.card.provider, ep.data))
-                            val frac = rp?.takeIf { it.durationMs > 0 && it.positionMs > 0 }?.let { it.positionMs.toFloat() / it.durationMs }
-                            EpisodeRow(i + 1, ep, d.posterUrl, frac) { c.playEpisode(vm, ep) }
+                            val rp = s.progress[ep.data]
+                            val watched = rp?.watched == true
+                            val frac = if (watched) 1f else rp?.takeIf { it.durationMs > 0 && it.positionMs > 0 }?.let { it.positionMs.toFloat() / it.durationMs }
+                            val dlId = episodeId(vm.card.provider, ep.data)
+                            val dl = downloads.firstOrNull { it.id == dlId }
+                            EpisodeRow(i + 1, ep, d.posterUrl, frac, watched, dl, onPlay = { c.playEpisode(vm, ep) }, onDownload = {
+                                when (dl?.status) {
+                                    null, cloudstream.desktop.app.DownloadItem.Status.Failed -> downloadFor = ep
+                                    cloudstream.desktop.app.DownloadItem.Status.Paused -> c.services.downloads.resume(dl.id)
+                                    cloudstream.desktop.app.DownloadItem.Status.Done -> c.playEpisode(vm, ep)
+                                    else -> c.services.downloads.pause(dl.id)
+                                }
+                            }) {
+                                buildList {
+                                    add(CardMenuItem("Play episode") { c.playEpisode(vm, ep) })
+                                    if (dl == null || dl.status == cloudstream.desktop.app.DownloadItem.Status.Failed) add(CardMenuItem("Download…") { downloadFor = ep })
+                                    else {
+                                        add(CardMenuItem("Download from another source…") { downloadFor = ep })
+                                        add(CardMenuItem("Delete download", destructive = true) { c.services.downloads.delete(dl.id, files = true) })
+                                    }
+                                    add(CardMenuItem("Reload links and play") { c.playEpisode(vm, ep, online = true) })
+                                    if (watched) add(CardMenuItem("Mark as unwatched", divider = true) { vm.setWatched(listOf(ep), false) })
+                                    else add(CardMenuItem("Mark as watched", divider = true) { vm.setWatched(listOf(ep), true) })
+                                    if (i > 0) add(CardMenuItem("Mark all above as watched") { vm.setWatched(episodes.take(i), true) })
+                                    add(CardMenuItem("Mark this and all above as watched") { vm.setWatched(episodes.take(i + 1), true) })
+                                    if (episodes.take(i + 1).any { s.progress[it.data] != null })
+                                        add(CardMenuItem("Clear progress of this and all above", destructive = true) { vm.setWatched(episodes.take(i + 1), false) })
+                                }
+                            }
                         }
                     }
                     if (d.recommendations.isNotEmpty()) {
@@ -120,6 +150,8 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
         TextButton(onClick = { c.back() }, modifier = Modifier.align(Alignment.TopStart).padding(start = 36.dp, top = TopBarHeight)) {
             Text("←  Back", color = Color.White, fontWeight = FontWeight.SemiBold)
         }
+        val loaded = (s.load as? DetailsLoad.Loaded)?.details
+        downloadFor?.let { ep -> if (loaded != null) DownloadDialog(c, vm, loaded, ep) { downloadFor = null } }
     }
 }
 
@@ -159,16 +191,24 @@ private fun Header(c: AppController, d: MediaDetails, vm: DetailsViewModel, s: c
             d.plot?.takeIf { it.isNotBlank() }?.let { Text(it, color = Color(0xFFE6E6EA), style = MaterialTheme.typography.bodyLarge, maxLines = 4, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) }
             if (d.tags.isNotEmpty()) Text(d.tags.take(6).joinToString("  ·  "), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
             Spacer4()
+            // The next episode's air time (the plugin's "next airing", else the first upcoming episode in the list).
+            val nextAir = d.nextAiring?.takeIf { it.atMs > System.currentTimeMillis() }?.let { "E${it.episode}" to it.atMs }
+                ?: d.episodes.firstOrNull { it.upcoming() }?.let { e -> (e.episode?.let { "E$it" } ?: "Next episode") to e.airDate!! }
+            nextAir?.let { (label, at) -> AirCountdown(at, prefix = "$label airs") }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 val target = vm.playTarget(s)
                 val resume = target?.let { s.resumeMs[it.data] }?.takeIf { it > 0 }
+                val targetUpcoming = target?.upcoming() == true
                 PrimaryButton(
                     when {
                         target == null -> "Play"
-                        resume != null -> "Resume" + (if (!d.isMovie) " ${target.label.substringBefore(" - ")}" else "")
+                        targetUpcoming -> "${target!!.episode?.let { "E$it" } ?: "Next episode"} is not out yet"
+                        // Resume also when the previous episode was finished: "Resume E2" after leaving E1 in the credits.
+                        resume != null || (!d.isMovie && s.progress.isNotEmpty() && !s.watched(target)) ->
+                            "Resume" + (if (!d.isMovie) " ${target.label.substringBefore(" - ")}" else "")
                         else -> if (d.isMovie) "Play" else "Play ${target.label.substringBefore(" - ")}"
                     },
-                    { target?.let { c.playEpisode(vm, it) } }, enabled = target != null,
+                    { target?.let { c.playEpisode(vm, it) } }, enabled = target != null && !targetUpcoming,
                 )
                 // CloudStream's bookmark button: pick a watch status (or remove).
                 Box {
@@ -198,15 +238,24 @@ private fun PillChip(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun EpisodeRow(n: Int, ep: EpisodeItem, fallbackThumb: String?, progress: Float?, onPlay: () -> Unit) {
+private fun EpisodeRow(
+    n: Int, ep: EpisodeItem, fallbackThumb: String?, progress: Float?, watched: Boolean,
+    download: cloudstream.desktop.app.DownloadItem?,
+    onPlay: () -> Unit, onDownload: () -> Unit, menu: () -> List<CardMenuItem>,
+) {
     val src = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     val hovered by src.collectIsHoveredAsState()
+    var menuAt by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    var menuItems by remember { mutableStateOf(emptyList<CardMenuItem>()) }
+    Box(Modifier.padding(horizontal = 40.dp, vertical = 2.dp)) {
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 40.dp, vertical = 2.dp).clip(RoundedCornerShape(8.dp))
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
             .background(if (hovered) Color(0xFF1C1C22) else Color.Transparent)
-            .hoverable(src).clickable(onClick = onPlay).padding(horizontal = 8.dp, vertical = 10.dp),
+            .hoverable(src).onSecondaryPress { at -> menuItems = menu(); menuAt = at }
+            .clickable(onClick = onPlay).padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(18.dp),
     ) {
+        val upcoming = ep.upcoming()
         Text("${ep.episode ?: n}", Modifier.width(30.dp), style = MaterialTheme.typography.headlineSmall, color = Color(0xFF8A8A94))
         Box(Modifier.width(176.dp).height(99.dp).clip(RoundedCornerShape(6.dp))) {
             RemoteImage(ep.posterUrl ?: fallbackThumb, Modifier.fillMaxSize(), placeholderText = ep.label)
@@ -220,12 +269,19 @@ private fun EpisodeRow(n: Int, ep: EpisodeItem, fallbackThumb: String?, progress
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(ep.name?.takeIf { it.isNotBlank() } ?: ep.label, color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f, fill = false), maxLines = 1)
+                val title = withoutUpcoming(ep.name)?.takeIf { it.isNotBlank() } ?: ep.episode?.let { "Episode $it" } ?: ep.label
+                Text(title, color = if (upcoming) Color(0xFFB0B0B8) else Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f, fill = false), maxLines = 1)
                 ep.group?.let { Badge(it) }
+                if (watched) Text("✓ Watched", color = Color(0xFF8A8A94), style = MaterialTheme.typography.labelMedium)
             }
-            ep.description?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2) }
+            if (upcoming) AirCountdown(ep.airDate!!)
+            else ep.airDate?.let { Text("Aired ${airDateText(it)}", style = MaterialTheme.typography.labelMedium, color = Color(0xFF8A8A94)) }
+            withoutUpcoming(ep.description)?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2) }
             // Watch progress is the bar on the thumbnail (no "Resume at" text).
         }
+        DownloadButton(download, onDownload)
+    }
+    menuAt?.let { at -> CardMenu(true, at, menuItems) { menuAt = null } }
     }
     HorizontalDivider(Modifier.padding(horizontal = 48.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 }
@@ -235,4 +291,37 @@ fun fmtTime(ms: Long): String {
     val s = ms / 1000
     val h = s / 3600; val m = (s % 3600) / 60; val sec = s % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
+}
+
+/** Plugins mark episodes not out yet with "Upcoming" in the name or description; the countdown says it instead. */
+private val upcomingWord = Regex("""\s*[\[(]?\b(upcoming|coming soon)\b[\])]?\s*[:\-–|·]?\s*""", RegexOption.IGNORE_CASE)
+fun withoutUpcoming(s: String?): String? = s?.replace(upcomingWord, " ")?.trim()
+
+private val airFormat = java.time.format.DateTimeFormatter.ofPattern("EEE, d MMM yyyy · HH:mm")
+fun airDateText(ms: Long): String =
+    java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).format(airFormat)
+
+/** "in 2d 4h 13m" (more than a day away) or a ticking "in 04:13:22", then the local date and time. */
+fun countdownText(ms: Long, now: Long): String {
+    val left = ((ms - now) / 1000).coerceAtLeast(0)
+    val d = left / 86_400; val h = (left % 86_400) / 3600; val m = (left % 3600) / 60; val sec = left % 60
+    return when {
+        left == 0L -> "now"
+        d > 0 -> "in ${d}d ${h}h ${m}m"
+        else -> "in %02d:%02d:%02d".format(h, m, sec)
+    }
+}
+
+@Composable
+private fun AirCountdown(atMs: Long, prefix: String = "Airs") {
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    androidx.compose.runtime.LaunchedEffect(atMs) {
+        while (now < atMs) { kotlinx.coroutines.delay(1000); now = System.currentTimeMillis() }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("⏱ $prefix ${countdownText(atMs, now)}", color = Color.Black, fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFFF5C518)).padding(horizontal = 7.dp, vertical = 2.dp))
+        Text(airDateText(atMs), color = Color(0xFFB0B0B8), style = MaterialTheme.typography.labelMedium)
+    }
 }

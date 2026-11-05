@@ -101,6 +101,15 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
     /** Sets an mpv property (resize modes etc.): e.g. "panscan" "1.0", "keepaspect" "no". */
     fun setProperty(name: String, value: String) { if (initialized) setProp(name, value) }
 
+    /** The file's chapters as (start seconds, title); empty when it has none. Blocks briefly: not on the UI thread. */
+    fun chapters(): List<Pair<Double, String>> {
+        if (!initialized) return emptyList()
+        val n = prop("chapter-list/count")?.toIntOrNull() ?: return emptyList()
+        return (0 until n).mapNotNull { i ->
+            prop("chapter-list/$i/time")?.toDoubleOrNull()?.let { it to (prop("chapter-list/$i/title") ?: "") }
+        }
+    }
+
     /** Raw mpv property (diagnostics / tests), e.g. "sub-text", "sid", "video-codec". */
     fun property(name: String): String? = if (initialized) prop(name) else null
 
@@ -203,6 +212,7 @@ class LibMpvPlayer(private val api: MpvApi = MpvApi.load(), val renderMode: Bool
             buffering = buffering,
             error = lastError,
             bufferPercent = if (buffering) prop("cache-buffering-state")?.toIntOrNull()?.coerceIn(0, 100) else null,
+            ended = ended && dur > 0,
         )
         logPlaybackHealth(cache, paused || idle || ended, pos)
     }

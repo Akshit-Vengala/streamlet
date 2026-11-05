@@ -17,6 +17,8 @@ import java.io.File
 object Screenshots {
     fun run(dir: File): Int {
         dir.mkdirs()
+        // STREAMLET_SHOTS=new: only the episode / download screens.
+        if (System.getenv("STREAMLET_SHOTS") == "new") return if (NewScreens.run(dir) == 0) 0 else 1
         var failed = 0
         val scenes: List<Pair<String, (AppController) -> Unit>> = listOf(
             "extensions" to { c -> c.goTo(Screen.Extensions); c.start(); Unit },
@@ -71,6 +73,7 @@ object Screenshots {
             File(dir, "home-loading.png").writeBytes(scene.render(t).encodeToData(EncodedImageFormat.PNG)!!.bytes)
             scene.close(); println("screenshot home-loading -> ${File(dir, "home-loading.png").absolutePath}")
         }.onFailure { failed++; println("screenshot home-loading failed: $it") }
+        failed += NewScreens.run(dir)
         return if (failed == 0) 0 else 1
     }
 }

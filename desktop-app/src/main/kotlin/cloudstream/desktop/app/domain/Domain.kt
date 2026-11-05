@@ -34,7 +34,11 @@ data class EpisodeItem(
     val description: String?,
     /** e.g. "Dubbed" / "Subbed" for anime providers. */
     val group: String? = null,
+    /** When it airs / aired (epoch ms), if the plugin knows. */
+    val airDate: Long? = null,
 ) {
+    /** Not out yet: airs after [now]. */
+    fun upcoming(now: Long = System.currentTimeMillis()) = airDate != null && airDate > now
     val label: String
         get() = buildString {
             if (season != null) append("S$season ")
@@ -61,6 +65,8 @@ data class MediaDetails(
     val isMovie: Boolean,
     /** External ids the plugin attached (keys: anilist, mal, kitsu, imdb, tmdb) for tracking and subtitle search. */
     val syncIds: Map<String, String> = emptyMap(),
+    /** The next episode's air time, when the plugin knows it (often not in [episodes] yet). */
+    val nextAiring: NextAiring? = null,
 ) {
     val isAnime: Boolean get() = type.startsWith("Anime", true) || type.equals("OVA", true)
 }
@@ -78,7 +84,9 @@ data class SourceLink(
 ) {
     val qualityLabel: String
         get() = when (quality) { 0 -> "Auto"; 400 -> "?"; 2160 -> "4K"; else -> "${quality}p" }
-    val playable: Boolean get() = url.startsWith("http", ignoreCase = true)
+    val playable: Boolean get() = url.startsWith("http", ignoreCase = true) || isLocalFile
+    /** A downloaded file (absolute path). */
+    val isLocalFile: Boolean get() = !url.contains("://") && java.io.File(url).isAbsolute
 }
 
 data class SubtitleItem(val lang: String, val url: String, val headers: Map<String, String>)
@@ -167,3 +175,29 @@ suspend fun <T> guarded(timeoutMs: Long, block: suspend () -> T): Outcome<T> =
     }
 
 data class InstalledView(val plugin: InstalledPlugin, val load: LoadResult?, val updateAvailable: PluginInfo?)
+
+/** Episode [episode] (of [season]) airs at [atMs] (epoch ms). */
+data class NextAiring(val episode: Int, val season: Int?, val atMs: Long)
+
+/** Plugins give epoch ms; a few give seconds. */
+fun epochMs(t: Long?): Long? = t?.takeIf { it > 0 }?.let { if (it < 100_000_000_000L) it * 1000 else it }
+
+/**
+ * Some plugins store a JSON object as an id (e.g. the MAL slot holding {"AniList":"172192"}): unpack such values into
+ * the ids they name, keep plain ids as they are, and drop anything that is not an id.
+ */
+fun normalizeSyncIds(pairs: List<Pair<String, String>>): Map<String, String> {
+    val out = LinkedHashMap<String, String>()
+    val keyOf = mapOf("mal" to "mal", "myanimelist" to "mal", "anilist" to "anilist", "kitsu" to "kitsu", "imdb" to "imdb", "tmdb" to "tmdb")
+    pairs.forEach { (k, v) ->
+        val t = v.trim()
+        if (t.startsWith("{")) runCatching {
+            com.google.gson.JsonParser.parseString(t).asJsonObject.entrySet().forEach { (jk, jv) ->
+                val key = keyOf[jk.lowercase()] ?: return@forEach
+                val id = runCatching { jv.asString }.getOrNull()?.trim().orEmpty()
+                if (id.isNotEmpty() && id != "null") out.putIfAbsent(key, id)
+            }
+        } else if (t.isNotEmpty()) out[k] = t
+    }
+    return out
+}

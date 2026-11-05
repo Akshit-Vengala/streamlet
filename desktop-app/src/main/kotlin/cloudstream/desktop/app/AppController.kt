@@ -77,11 +77,16 @@ class AppController(val services: AppServices) {
      * Episode / Play button: start the source lookup and open the player straight away; the player shows the loading
      * screen with "Skip loading" and starts the best source by priority when the lookup ends (or on skip).
      */
-    fun playEpisode(vm: DetailsViewModel, ep: cloudstream.desktop.app.domain.EpisodeItem) {
+    fun playEpisode(vm: DetailsViewModel, ep: cloudstream.desktop.app.domain.EpisodeItem, online: Boolean = false) {
         val d = (vm.state.value.load as? cloudstream.desktop.app.vm.DetailsLoad.Loaded)?.details ?: return
-        val resume = vm.state.value.resumeMs[ep.data]
-            ?: services.library.resume(cloudstream.desktop.app.vm.episodeId(vm.card.provider, ep.data))
-                ?.takeIf { it.durationMs == 0L || it.positionMs < it.durationMs * 95 / 100 }?.positionMs ?: 0L
+        val resume = services.library.resume(cloudstream.desktop.app.vm.episodeId(vm.card.provider, ep.data))?.startMs ?: 0L
+        // Downloaded: play the file (works offline); "Reload links" passes online = true.
+        if (!online) services.downloads.finished(cloudstream.desktop.app.vm.episodeId(vm.card.provider, ep.data))?.let { dl ->
+            vm.recordHistory(services.history::record, ep)
+            library.refresh()
+            play(PlayRequest(vm.card, d.name, ep, dl.localLink(), dl.localSubs(), resume))
+            return
+        }
         vm.recordHistory(services.history::record, ep)
         library.refresh() // Continue Watching shows it on return
         vm.findSources(ep)
@@ -122,5 +127,11 @@ class AppController(val services: AppServices) {
         if (s == Screen.Library) library.refresh()
         detailsCache.clear()
         nav.goTo(s)
+    }
+
+    /** Plays a finished download from the Downloads screen (no title page needed: works offline). */
+    fun playDownload(item: DownloadItem) {
+        val resume = services.library.resume(item.id)?.startMs ?: 0L
+        play(PlayRequest(item.card(), item.titleName, item.episodeItem(), item.localLink(), item.localSubs(), resume))
     }
 }

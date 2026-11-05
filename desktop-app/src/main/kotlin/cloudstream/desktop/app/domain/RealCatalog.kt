@@ -81,7 +81,7 @@ class RealProvider(val api: MainAPI) : Provider {
 
     private fun Episode.toItem(group: String? = null) = EpisodeItem(
         data = data, name = name, season = season, episode = episode, posterUrl = posterUrl,
-        description = description, group = group,
+        description = description, group = group, airDate = epochMs(date),
     )
 
     private fun LoadResponse.toDetails(): MediaDetails {
@@ -110,9 +110,12 @@ class RealProvider(val api: MainAPI) : Provider {
                     listOfNotNull(
                         r.getAniListId()?.let { "anilist" to it }, r.getMalId()?.let { "mal" to it }, r.getKitsuId()?.let { "kitsu" to it },
                         r.getImdbId()?.let { "imdb" to it }, r.getTMDbId()?.let { "tmdb" to it },
-                    ).filter { it.second.isNotBlank() && it.second != "null" }.toMap()
+                    ).filter { it.second.isNotBlank() && it.second != "null" }.let(::normalizeSyncIds)
                 }
             }.getOrDefault(emptyMap()),
+            nextAiring = (this as? com.lagradost.cloudstream3.EpisodeResponse)?.nextAiring?.let { n ->
+                epochMs(n.unixTime)?.let { NextAiring(n.episode, n.season, it) }
+            },
         )
     }
 }

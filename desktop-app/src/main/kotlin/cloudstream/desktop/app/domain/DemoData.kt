@@ -62,7 +62,10 @@ class DemoProvider(
             plot = "A demo plot for $title. Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
             year = 2024, tags = listOf("Drama", "Demo"), score = 7.8, type = types.first(), durationMin = 110,
             episodes = if (series) (1..12).map {
-                EpisodeItem("$url#e$it", "Episode $it", 1 + (it - 1) / 6, it, null, "Plot of episode $it")
+                // Weekly episodes; 5 and 6 are not out yet (countdowns), the rest aired.
+                val now = System.currentTimeMillis()
+                val air = when (it) { 5 -> now + (3 * 3600 + 13 * 60) * 1000L; 6 -> now + ((2 * 24 + 4) * 3600 + 13 * 60) * 1000L; else -> now - (5 - it) * 7 * 86_400_000L }
+                EpisodeItem("$url#e$it", if (it >= 5) "Upcoming" else "Episode $it", 1 + (it - 1) / 6, it, null, if (it >= 5) null else "Plot of episode $it", airDate = air)
             } else listOf(EpisodeItem("$url#movie", "Movie", null, null, null, null)),
             recommendations = cards("Similar", 4),
             isMovie = !series,

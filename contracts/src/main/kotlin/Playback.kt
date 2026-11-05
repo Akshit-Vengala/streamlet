@@ -35,4 +35,6 @@ data class PlayerState(
     val error: String?,
     /** While [buffering]: how full the cache is, 0..100 (null = unknown). */
     val bufferPercent: Int? = null,
+    /** The file played to its end (mpv keeps the last frame: keep-open). */
+    val ended: Boolean = false,
 )

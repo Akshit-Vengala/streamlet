@@ -10,6 +10,7 @@ import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
@@ -141,6 +142,14 @@ class PlayerUi {
 
     var onBack: () -> Unit = {}
     var onNext: () -> Unit = {}
+    /** The intro / recap / credits part playing now (its skip button shows), or null. */
+    var skip by mutableStateOf<cloudstream.desktop.app.SkipSegment?>(null)
+    var onSkip: () -> Unit = {}
+    /** Seconds until the next episode starts by itself (end of an episode), or null. */
+    var autoNextIn by mutableStateOf<Int?>(null)
+    /** The credits are on (or the episode is about over): offer "Next episode" over the video. */
+    var nextPrompt by mutableStateOf(false)
+    var onCancelAutoNext: () -> Unit = {}
     var hasPrev by mutableStateOf(false)
     /** Repeat the current file (VLC's L). */
     var loop by mutableStateOf(false)
@@ -329,7 +338,7 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
     // Fade out after 3 s without mouse movement while playing and no sheet open; the pointer hides with them.
     val sheetOpen = dialog != null || ui.extraDialog != null
     LaunchedEffect(visible, lastActivity, sheetOpen, ui.state.playing) {
-        if (visible && !sheetOpen && ui.state.playing) { delay(3000); visible = false }
+        if (visible && !sheetOpen && ui.state.playing) { delay(1500); visible = false }
     }
     LaunchedEffect(flash) { if (flash != null) { delay(1200); flash = null } }
     val alpha by animateFloatAsState(if (visible || sheetOpen) 1f else 0f, tween(300))
@@ -456,6 +465,18 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
         flash?.let {
             Text(it, Modifier.align(Alignment.Center).clip(RoundedCornerShape(8.dp)).background(Color.Black.copy(0.7f)).padding(horizontal = 18.dp, vertical = 10.dp),
                 color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        }
+        // Skip intro / credits and Next episode: bottom-right over the video, shown even with the controls hidden.
+        if (!loading) Row(
+            Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = if (alpha > 0.5f) 150.dp else 48.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ui.skip?.let { seg -> PromptButton(seg.kind.label + "  ›", primary = false) { ui.onSkip() } }
+            val next = ui.autoNextIn
+            if (ui.hasNext && next != null) {
+                PromptButton("Cancel", primary = false) { ui.onCancelAutoNext() }
+                PromptButton("Next episode in $next  ›", primary = true) { ui.onNext() }
+            } else if (ui.hasNext && ui.nextPrompt) PromptButton("Next episode  ›", primary = true) { ui.onNext() }
         }
         if (ui.holding) {
             Text("2x  ▶▶", Modifier.align(Alignment.TopCenter).padding(top = 24.dp).clip(RoundedCornerShape(20.dp))
@@ -956,7 +977,7 @@ private fun SourcesDialog(ui: PlayerUi, onClose: () -> Unit) {
                             }
                             hideAt?.let { at ->
                                 CardMenu(true, at, buildList {
-                                    val server = l.name.trim()
+                                    val server = cloudstream.desktop.app.serverKey(l.name)
                                     if (server.isNotEmpty() && !server.equals(l.source, true))
                                         add(CardMenuItem("Hide this server: $server") { ui.onHideSource(server) })
                                     if (l.source.isNotBlank()) add(CardMenuItem("Hide everything from ${l.source}") { ui.onHideSource(l.source) })
@@ -1181,3 +1202,16 @@ private fun VideoDialog(ui: PlayerUi, onClose: () -> Unit) {
 }
 
 private fun trackName(t: cloudstream.desktop.player.MediaTrack) = listOfNotNull(t.lang, t.title).joinToString(" - ").ifBlank { "Track ${t.id}" }
+
+/** A large pill over the video (Skip intro, Next episode). */
+@Composable
+private fun PromptButton(label: String, primary: Boolean, onClick: () -> Unit) {
+    Text(
+        label,
+        Modifier.clip(RoundedCornerShape(6.dp))
+            .background(if (primary) Color.White else Color.Black.copy(0.6f))
+            .border(1.dp, Color.White.copy(if (primary) 0f else 0.7f), RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick).padding(horizontal = 18.dp, vertical = 10.dp),
+        color = if (primary) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp,
+    )
+}

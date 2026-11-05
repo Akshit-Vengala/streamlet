@@ -64,12 +64,13 @@ sealed interface Screen {
     data object Home : Screen
     data object Search : Screen
     data object Library : Screen
+    data object Downloads : Screen
     data object Extensions : Screen
     data object Settings : Screen
     data class Details(val card: MediaCard) : Screen
     data class Player(val request: PlayRequest) : Screen
 
-    val isTopLevel: Boolean get() = this is Home || this is Search || this is Library || this is Extensions || this is Settings
+    val isTopLevel: Boolean get() = this is Home || this is Search || this is Library || this is Downloads || this is Extensions || this is Settings
 }
 
 /** Back stack navigation. Top-level destinations replace the whole stack. */

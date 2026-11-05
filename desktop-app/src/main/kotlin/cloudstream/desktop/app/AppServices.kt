@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.awt.Desktop
 import java.io.File
+import kotlinx.coroutines.launch
 import java.net.URI
 
 /** Where a player came from, so the UI can say plainly when it is not the real one. */
@@ -69,6 +70,13 @@ class AppServices(
     val sync: cloudstream.desktop.app.sync.SyncManager get() = profiles.data().sync
 
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Episode downloads (machine-wide, like the folder they go to). */
+    val downloads: Downloads by lazy {
+        Downloads(File(rootDir, "data/downloads.json"), scope) { globalSettings.downloadFolder() }.also { d ->
+            scope.launch { globalSettings.maxDownloads.collect { d.maxParallel = it } }
+        }
+    }
 
     /** Bumped whenever the provider set may have changed (extension loaded/unloaded). */
     private val _catalogRevision = MutableStateFlow(0)

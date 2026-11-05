@@ -58,8 +58,12 @@ data class DetailsState(
     /** Library status of this title; null = not in the library. */
     val status: WatchStatus? = null,
     val links: LinksState = LinksState(),
-    val resumeMs: Map<String, Long> = emptyMap(),
+    /** Saved progress per episode (by [EpisodeItem.data]): position, or watched. */
+    val progress: Map<String, cloudstream.desktop.contracts.ResumePoint> = emptyMap(),
 ) {
+    /** Where an unfinished episode was left (watched ones are not here). */
+    val resumeMs: Map<String, Long> get() = progress.filterValues { !it.watched && it.positionMs > 0 }.mapValues { it.value.positionMs }
+    fun watched(ep: EpisodeItem) = progress[ep.data]?.watched == true
     val bookmarked: Boolean get() = status != null
 }
 
@@ -93,7 +97,7 @@ class DetailsViewModel(
                         load = DetailsLoad.Loaded(d),
                         season = seasons.firstOrNull(),
                         group = d.episodes.mapNotNull { it.group }.distinct().firstOrNull(),
-                        resumeMs = d.episodes.mapNotNull { e -> library.resume(episodeId(card.provider, e.data))?.let { e.data to it.positionMs } }.toMap(),
+                        progress = readProgress(d.episodes),
                     )
                 }
             }
@@ -110,10 +114,34 @@ class DetailsViewModel(
         return d.episodes.filter { (s.season == null || it.season == null || it.season == s.season) && (s.group == null || it.group == null || it.group == s.group) }
     }
 
-    /** The episode "Play" should start: the last one with a resume point (in list order), else the first visible one. */
+    /**
+     * The episode "Play" should start: the last one (in list order) with progress; if that one was watched (left in the
+     * credits, or marked), the episode after it. Else the first visible one.
+     */
     fun playTarget(s: DetailsState = _state.value): EpisodeItem? {
         val eps = visibleEpisodes(s)
-        return eps.lastOrNull { (s.resumeMs[it.data] ?: 0L) > 0L } ?: eps.firstOrNull()
+        val i = eps.indexOfLast { e -> s.progress[e.data]?.let { it.watched || it.positionMs > 0 } == true }
+        if (i < 0) return eps.firstOrNull()
+        return if (s.watched(eps[i])) eps.getOrNull(i + 1) ?: eps[i] else eps[i]
+    }
+
+    private fun readProgress(eps: List<EpisodeItem>) =
+        eps.mapNotNull { e -> library.resume(episodeId(card.provider, e.data))?.let { e.data to it } }.toMap()
+
+    /** Re-reads saved progress (back from the player, or after marking episodes). */
+    fun refreshProgress() {
+        val d = (state.value.load as? DetailsLoad.Loaded)?.details ?: return
+        _state.update { it.copy(progress = readProgress(d.episodes)) }
+    }
+
+    /** Marks [eps] watched (or clears them: [watched] false). */
+    fun setWatched(eps: List<EpisodeItem>, watched: Boolean) {
+        val t = now()
+        eps.forEach { e ->
+            val id = episodeId(card.provider, e.data)
+            library.setResume(if (watched) ResumePoint.markedWatched(id, t) else ResumePoint.cleared(id, t))
+        }
+        refreshProgress()
     }
 
     fun toggleBookmark() = setStatus(if (state.value.bookmarked) null else WatchStatus.PlanToWatch)

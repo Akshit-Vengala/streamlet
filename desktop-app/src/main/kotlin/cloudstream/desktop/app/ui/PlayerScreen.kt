@@ -175,7 +175,9 @@ private class PlayerSession(
         ui.episodeLine = req.episode.label.takeIf { it != "Play" && it != req.titleName && it != "Movie" }.orEmpty()
         ui.hasNext = next != null
         ui.onBack = { c.back() }
-        ui.onNext = { if (next != null) { c.back(); c.playEpisode(dm, next) } }
+        ui.onNext = { if (next != null) { ui.autoNextIn = null; c.back(); c.playEpisode(dm, next) } }
+        ui.onSkip = { ui.skip?.let { seg -> skipped += seg.kind; ui.skip = null; h.player.seek(seg.endMs) } }
+        ui.onCancelAutoNext = { autoNextCancelled = true; ui.autoNextIn = null }
         val prev = dm.visibleEpisodes().let { l -> l.indexOfFirst { it.data == req.episode.data }.takeIf { it > 0 }?.let { l[it - 1] } }
         ui.hasPrev = prev != null
         ui.onPrev = { if (prev != null) { c.back(); c.playEpisode(dm, prev) } }
@@ -261,6 +263,63 @@ private class PlayerSession(
         }
     }
 
+    /** Intro / recap / credits of the open file (see [SkipTimes]); recomputed for every file opened. */
+    @Volatile private var segments: List<cloudstream.desktop.app.SkipSegment> = emptyList()
+    /** Segment kinds already skipped (or dismissed) in this file: not offered again. */
+    private val skipped = java.util.Collections.synchronizedSet(HashSet<cloudstream.desktop.app.SkipSegment.Kind>())
+    @Volatile private var autoNextCancelled = false
+    /** AniSkip answer for this episode (by duration, rounded to a minute: sources of one episode differ by seconds). */
+    private val onlineSkips = HashMap<Long, List<cloudstream.desktop.app.SkipSegment>>()
+
+    /** Waits for the open file's duration, then reads its chapters and (anime) AniSkip times. */
+    private suspend fun loadSegments(gen: Int) {
+        var dur = 0L
+        while (generation == gen) { dur = lastState.durationMs; if (dur > 0) break; delay(500) }
+        if (generation != gen || dur <= 0) return
+        val chapters = withContext(Dispatchers.IO) { mpv?.chapters().orEmpty() }
+        val fromChapters = cloudstream.desktop.app.SkipTimes.fromChapters(chapters, dur)
+        val d = (dm.state.value.load as? DetailsLoad.Loaded)?.details
+        val epNo = req.episode.episode
+        val online = if (d != null && d.isAnime && epNo != null && fromChapters.size < 2)
+            onlineSkips.getOrPut(dur / 60_000) { cloudstream.desktop.app.SkipTimes.aniSkip(d.syncIds, epNo, dur) } else emptyList()
+        if (generation != gen) return
+        segments = cloudstream.desktop.app.SkipTimes.merge(fromChapters, online)
+        if (segments.isNotEmpty()) cloudstream.desktop.app.AppLog.get("skip").info("Skip times for ${req.episode.label}: " +
+            segments.joinToString { "${it.kind} ${it.startMs / 1000}-${it.endMs / 1000}s" } + if (online.isNotEmpty()) " (AniSkip)" else " (chapters)")
+    }
+
+    /** Skip buttons, auto-skip, the credits "Next episode" prompt and the end-of-episode countdown. */
+    private fun updatePrompts(st: PlayerState) {
+        val hasNext = ui.hasNext
+        val seg = segments.firstOrNull { st.positionMs in it && it.kind !in skipped }
+        if (seg != null && seg.kind != cloudstream.desktop.app.SkipSegment.Kind.Credits && settings.autoSkipIntro.value && st.playing) {
+            skipped += seg.kind; h.player.seek(seg.endMs); c.services.toast("Skipped ${seg.kind.name.lowercase()}")
+            ui.skip = null
+        } else {
+            // In the credits with an episode after this one, "Next episode" replaces "Skip credits".
+            ui.skip = seg?.takeIf { !(it.kind == cloudstream.desktop.app.SkipSegment.Kind.Credits && hasNext) }
+        }
+        val inCredits = seg?.kind == cloudstream.desktop.app.SkipSegment.Kind.Credits ||
+            (segments.none { it.kind == cloudstream.desktop.app.SkipSegment.Kind.Credits } && cloudstream.desktop.contracts.isWatchedAt(st.positionMs, st.durationMs))
+        ui.nextPrompt = hasNext && inCredits
+        if (!st.ended) { if (ui.autoNextIn != null) ui.autoNextIn = null; autoNextCancelled = false }
+    }
+
+    /** At the end of the file: count down, then play the next episode (unless cancelled or turned off). */
+    private suspend fun autoNext() {
+        while (true) {
+            delay(500)
+            val st = lastState
+            if (!st.ended || !ui.hasNext || !settings.autoNextEpisode.value || autoNextCancelled || ui.autoNextIn != null) continue
+            for (s in 5 downTo 1) {
+                ui.autoNextIn = s
+                delay(1000)
+                if (autoNextCancelled || !lastState.ended) { ui.autoNextIn = null; break }
+            }
+            if (ui.autoNextIn != null) { ui.onNext(); return }
+        }
+    }
+
     /** All long-running work of the session; cancelled when the player screen goes away. */
     suspend fun run() = coroutineScope {
         PlayerDebug.player = mpv
@@ -269,6 +328,7 @@ private class PlayerSession(
             var synced = false
             h.player.state.collect { st ->
                 lastState = st; ui.applyPlayerState(st)
+                updatePrompts(st)
                 if (st.playing && st.positionMs > 0) playedSinceOpen = true
                 // Tracking: once ~90% watched, raise progress on signed-in trackers (once per play).
                 if (!synced && st.durationMs > 60_000 && st.positionMs >= st.durationMs * 9 / 10) {
@@ -296,6 +356,9 @@ private class PlayerSession(
             }
         }
         launch { c.fullscreen.collect { ui.fullscreen = it } }
+        // Skip times for every file opened (a source switch is another file), and the end-of-episode countdown.
+        launch { var gen = -1; while (true) { if (generation != gen) { gen = generation; segments = emptyList(); skipped.clear(); launch { loadSegments(gen) } }; delay(300) } }
+        launch { autoNext() }
         // Audio streams of the current file (mpv property reads block: never on the UI thread).
         launch(Dispatchers.IO) {
             while (true) {
@@ -501,8 +564,8 @@ private fun PlayerBody(c: AppController, req: PlayRequest, s: PlayerSession) {
 }
 
 private fun saveResume(c: AppController, req: PlayRequest, st: PlayerState) {
-    // Near the end counts as finished: clear the resume point so the next play starts at the beginning.
-    val finished = st.durationMs > 0 && st.positionMs >= st.durationMs * 95 / 100
+    // Kept as is: a point in the credits reads as watched (ResumePoint.watched), so the title page offers the next
+    // episode and playing this one again starts at the beginning (ResumePoint.startMs).
     val id = episodeId(req.card.provider, req.episode.data)
-    c.services.library.setResume(ResumePoint(id, if (finished) 0 else st.positionMs, st.durationMs, System.currentTimeMillis()))
+    c.services.library.setResume(ResumePoint(id, st.positionMs, st.durationMs, System.currentTimeMillis()))
 }

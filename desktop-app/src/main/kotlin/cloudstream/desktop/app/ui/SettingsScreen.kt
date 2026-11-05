@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -92,6 +93,8 @@ private fun PlayerSection(c: AppController) {
     val player by st.playerChoice.collectAsStateCompat()
     val back by st.seekBackSeconds.collectAsStateCompat()
     val fwd by st.seekForwardSeconds.collectAsStateCompat()
+    val autoNext by st.autoNextEpisode.collectAsStateCompat()
+    val autoSkip by st.autoSkipIntro.collectAsStateCompat()
     val steps = listOf(5, 10, 15, 20, 30, 45, 60, 90)
     SectionCard {
         Group("Playback")
@@ -101,6 +104,10 @@ private fun PlayerSection(c: AppController) {
         SettingRow("Preferred quality", "Sources closest to this (at or below it first) are tried first.") {
             Dropdown(AppSettings.qualityChoices.firstOrNull { it.first == quality }?.second ?: "${quality}p", AppSettings.qualityChoices, { it.second }) { st.setDefaultQuality(it.first) }
         }
+        Spacer8()
+        Group("Episodes")
+        SettingRow("Play the next episode automatically", "A 5-second countdown at the end, which you can cancel.") { Switch(autoNext, { st.setAutoNextEpisode(it) }) }
+        SettingRow("Skip intros automatically", "Uses the video's chapters, or AniSkip for anime. Otherwise a \"Skip intro\" button shows.") { Switch(autoSkip, { st.setAutoSkipIntro(it) }) }
         Spacer8()
         Group("Seeking")
         SettingRow("Rewind step", "Player button and Left arrow.") { Dropdown("$back s", steps, { "$it s" }) { st.setSeekBackSeconds(it) } }
@@ -185,7 +192,58 @@ private fun DataSection(c: AppController) {
         Text("Settings, library, history, installed extensions and caches live here.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer8()
         OutlinedButton(onClick = { cloudstream.desktop.app.openPath(c.services.rootDir) }) { Text("Open folder") }
+        Spacer8()
+        DownloadSettings(c)
+        Spacer8()
+        NetworkSettings(c)
     }
+}
+
+/** CloudStream's "DNS over HTTPS": pick a resolver, and test it. */
+@Composable
+private fun NetworkSettings(c: AppController) {
+    val gs = c.services.globalSettings
+    val dns by gs.dnsProvider.collectAsStateCompat()
+    var test by remember { mutableStateOf<String?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    Group("Network")
+    SettingRow("DNS over HTTPS", "Look sites up through this resolver instead of your provider's DNS, which gets past DNS blocking. Used by extensions and HLS downloads.") {
+        Dropdown(dns.label, cloudstream.desktop.webview.DohProvider.entries.toList(), { it.label }) { gs.setDnsProvider(it); test = null }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedButton(onClick = {
+            test = "Testing…"
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val r = cloudstream.desktop.webview.NetworkDns.test(dns, "github.com")
+                test = r.fold({ "${dns.label}: github.com → ${it.take(3).joinToString()}" }, { "${dns.label} failed: ${it.message ?: it.javaClass.simpleName}" })
+            }
+        }) { Text("Test") }
+        test?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable
+private fun DownloadSettings(c: AppController) {
+    val gs = c.services.globalSettings
+    val dir by gs.downloadDir.collectAsStateCompat()
+    val max by gs.maxDownloads.collectAsStateCompat()
+    val folder = dir?.let { java.io.File(it) } ?: cloudstream.desktop.app.defaultDownloadDir()
+    Group("Downloads")
+    Text(folder.absolutePath, style = MaterialTheme.typography.bodyMedium)
+    Text("Episodes and their subtitles are saved here, one folder per title. Changing it does not move earlier downloads.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Spacer8()
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = {
+            val ch = javax.swing.JFileChooser(folder.takeIf { it.isDirectory } ?: folder.parentFile).apply {
+                fileSelectionMode = javax.swing.JFileChooser.DIRECTORIES_ONLY; dialogTitle = "Download folder"
+            }
+            if (ch.showOpenDialog(null) == javax.swing.JFileChooser.APPROVE_OPTION) gs.setDownloadDir(ch.selectedFile.absolutePath)
+        }) { Text("Change…") }
+        OutlinedButton(onClick = { folder.mkdirs(); cloudstream.desktop.app.openPath(folder) }) { Text("Open folder") }
+        if (dir != null) TextButton(onClick = { gs.setDownloadDir(null) }) { Text("Use default") }
+    }
+    SettingRow("Downloads at the same time", null) { Dropdown("$max", listOf(1, 2, 3, 4, 5, 6, 8), { "$it" }) { gs.setMaxDownloads(it) } }
 }
 
 @Composable

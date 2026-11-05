@@ -39,6 +39,16 @@ class SourceOrderTest {
         assertEquals(listOf("Other 720"), orderSources(links, emptyList(), hidden = setOf("Mirror"), preferred = 1080).map { it.name })
     }
 
+    @Test fun `a hidden server stays hidden when its quality or episode details change`() {
+        fun a(name: String) = SourceLink("Mirror", name, "https://mirror/${name.hashCode()}", "", 1080, emptyMap(), true, false)
+        val links = listOf(a("Mirror [North - 720p]"), a("Mirror [North - S01E02 Direct MP4 - 1080p]"), a("Mirror [North · Relay - 1080p]"), a("Mirror [South - 1080p]"))
+        // Hidden while watching another episode at another quality (the full name as it was saved before).
+        assertEquals(listOf("Mirror [North · Relay - 1080p]", "Mirror [South - 1080p]"),
+            orderSources(links, emptyList(), hidden = setOf("Mirror [North - S01E01 Direct MP4 - 1080p]"), preferred = 1080).map { it.name })
+        assertEquals("Mirror [North]", serverKey("Mirror [North - 1080p / Auto]"))
+        assertEquals("Plain name", serverKey("Plain name"))
+    }
+
     @Test fun `hidden sources are removed and unplayable links go last`() {
         val links = listOf(l("X", 1080, playable = false), l("A", 720), l("Bad", 1080))
         val out = orderSources(links, emptyList(), hidden = setOf("bad"), preferred = 0)
