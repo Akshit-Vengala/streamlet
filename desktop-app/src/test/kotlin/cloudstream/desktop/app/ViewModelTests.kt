@@ -180,6 +180,16 @@ class DetailsViewModelTest {
         assertTrue((vm2.state.value.load as DetailsLoad.Failed).message.contains("NotImplementedError"))
     }
 
+    @Test fun `mark this and all above as watched, then clear`() = runTest {
+        val vm = DetailsViewModel(backgroundScope, { DemoProvider("Demo Movies") }, InMemoryLibraryStore(), AppSettings(InMemoryKeyValueStore()), card)
+        vm.load().join()
+        val eps = vm.visibleEpisodes()
+        vm.setWatched(eps.take(3), true)
+        assertEquals(listOf(true, true, true, false), eps.take(4).map { vm.state.value.watched(it) })
+        vm.setWatched(eps.take(2), false)
+        assertEquals(listOf(false, false, true), eps.take(3).map { vm.state.value.watched(it) })
+    }
+
     @Test fun `resume points are shown per episode`() = runTest {
         val lib = InMemoryLibraryStore()
         lib.setResume(ResumePoint(episodeId("Demo Movies", "demo://Demo Movies/Show-2#e3"), 90_000, 600_000, 1))

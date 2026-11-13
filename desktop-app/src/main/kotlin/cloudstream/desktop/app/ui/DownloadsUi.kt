@@ -285,8 +285,7 @@ private fun ShowCard(c: AppController, group: List<DownloadItem>, open: Boolean,
         TextButton(onClick = { c.openDetails(head.card()) }) { Text("Open title") }
         // The arrow: down when closed, up when the episode list is showing.
         Box(Modifier.size(36.dp).clip(CircleShape).background(Color.White.copy(0.08f)).clickable(onClick = onToggle), contentAlignment = Alignment.Center) {
-            Text("›", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold,
-                modifier = Modifier.rotate(if (open) -90f else 90f).padding(bottom = 3.dp))
+            GlyphIcon(if (open) Glyph.ChevronUp else Glyph.ChevronDown, 20.dp)
         }
     }
 }

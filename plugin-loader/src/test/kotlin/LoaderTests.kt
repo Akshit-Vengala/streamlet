@@ -59,6 +59,43 @@ class RepoClientTest {
     }
 }
 
+class ConverterCacheTest {
+    /** A saved jar from an older converter is used when reconversion fails; unused cache jars are deleted. */
+    @Test fun staleJarFallbackAndCleanup() = runBlocking {
+        val dir = Files.createTempDirectory("cs-test").toFile()
+        val sha = "a".repeat(64)
+        val cs3 = File(dir, "r/A.cs3").apply { parentFile.mkdirs(); writeText("not a zip") }
+        val jars = File(dir, "jars").apply { mkdirs() }
+        val saved = File(jars, "$sha-c1.jar").apply { writeText("old") }
+        val unused = File(jars, "${"b".repeat(64)}-c1.jar").apply { writeText("x") }
+        val temp = File(jars, "d2j123.jar").apply { writeText("in progress") }
+        File(dir, "state.json").writeText("""{"repos":[],"installed":[{"info":{"internalName":"A","name":"A","version":1,
+            "url":"https://x/A.cs3","repoUrl":"https://x/repo.json","status":1},
+            "cs3Path":${json.writeValueAsString(cs3.absolutePath)},"jarPath":${json.writeValueAsString(saved.absolutePath)},"sha256":"$sha"}]}""")
+        val repo = DesktopPluginRepository(dir, FakeHttp(emptyMap()), loader = PluginLoader())
+        val r = repo.loadAll().single()
+        assertTrue(r is LoadResult.Failed) // the .cs3 is junk either way; what matters is which jar was kept
+        assertTrue(saved.isFile, "the saved jar is still referenced and must be kept")
+        assertFalse(unused.exists(), "a jar no extension uses is deleted")
+        assertTrue(temp.isFile, "temp files of a conversion are not touched")
+        dir.deleteRecursively()
+    }
+
+    @Test fun foreignComposeStableReadsBecomeZero() {
+        fun getStatic(owner: String) = org.objectweb.asm.tree.FieldInsnNode(org.objectweb.asm.Opcodes.GETSTATIC, owner, "\$stable", "I")
+        val m = org.objectweb.asm.tree.MethodNode(0, "m", "()V", null, null).apply {
+            instructions.add(getStatic("p/Own")); instructions.add(getStatic("app/Host"))
+        }
+        val c = org.objectweb.asm.tree.ClassNode().apply { name = "p/Own"; methods.add(m) }
+        val warnings = ArrayList<String>()
+        stubForeignComposeStability(listOf(c), warnings)
+        val insns = m.instructions.toArray()
+        assertEquals("p/Own", (insns[0] as org.objectweb.asm.tree.FieldInsnNode).owner, "the extension's own field stays")
+        assertEquals(org.objectweb.asm.Opcodes.ICONST_0, insns[1].opcode)
+        assertEquals(1, warnings.size)
+    }
+}
+
 class MissingClassTest {
     @Test fun extractsNoClassDef() {
         val t = RuntimeException("w", java.lang.reflect.InvocationTargetException(

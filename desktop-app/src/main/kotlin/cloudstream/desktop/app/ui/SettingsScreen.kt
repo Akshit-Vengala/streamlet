@@ -2,6 +2,8 @@ package cloudstream.desktop.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -144,13 +146,29 @@ private fun SourcesSection(c: AppController) {
         if (priority.isEmpty()) Text("Nothing ranked yet.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         else Text(priority.withIndex().joinToString("   ") { (i, n) -> "#${i + 1} $n" }, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp))
         Spacer8()
-        Group("Hidden sources")
+        var hiddenOpen by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+        Row(
+            Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                .clickable(enabled = hidden.isNotEmpty()) { hiddenOpen = !hiddenOpen }.padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.weight(1f)) { Group("Hidden sources (${hidden.size})") }
+            if (hidden.isNotEmpty()) Text(if (hiddenOpen) "▾" else "▸", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Text("Hidden sources (or single servers, e.g. \"Source [Server 1]\") are never listed or played. Hide them from the player: Source → ⊘ or right-click.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (hidden.isEmpty()) Text("None.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        hidden.sortedBy { it.lowercase() }.forEach { name ->
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text(name, Modifier.weight(1f)); TextButton(onClick = { st.setSourceHidden(name, false) }) { Text("Unhide") }
+        else if (!hiddenOpen) Text("${hidden.size} hidden. Click the title to show them.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        else Column(
+            // Indented under the title with a guide line, so the entries read as part of "Hidden sources".
+            Modifier.padding(start = 12.dp, top = 6.dp).drawBehind {
+                drawRect(Color.White.copy(alpha = 0.12f), size = androidx.compose.ui.geometry.Size(2.dp.toPx(), size.height))
+            }.padding(start = 14.dp),
+        ) {
+            hidden.sortedBy { it.lowercase() }.forEach { name ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(name, Modifier.weight(1f)); TextButton(onClick = { st.setSourceHidden(name, false) }) { Text("Unhide") }
+                }
             }
         }
         Spacer8()

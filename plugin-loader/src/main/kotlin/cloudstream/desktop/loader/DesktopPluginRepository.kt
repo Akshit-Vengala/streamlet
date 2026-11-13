@@ -202,12 +202,38 @@ class DesktopPluginRepository(
         state.installed.map { InstalledPlugin(it.info, it.cs3Path, it.jarPath) }
 
     override suspend fun loadAll(): List<LoadResult> = withContext(Dispatchers.IO) {
-        state.installed.filter { it.info.status != 0 }.map { rec ->
-            val jar = File(rec.jarPath).takeIf { it.isFile }
-                ?: runCatching { converter.convert(File(rec.cs3Path), rec.sha256) }.getOrElse {
-                    return@map PluginLoader.failure(rec.info.name, it)
-                }
+        val results = state.installed.filter { it.info.status != 0 }.map { rec ->
+            // Always the current converter's jar, never the saved path: a CONVERTER_VERSION bump (a conversion fix)
+            // must reach extensions that are already installed, not only new installs and updates.
+            val jar = runCatching { converter.convert(File(rec.cs3Path), rec.sha256) }.getOrElse { e ->
+                // Reconversion failed: the jar it was converted to before still works better than nothing.
+                File(rec.jarPath).takeIf { it.isFile }
+                    ?.also { log.warning("Reconverting ${rec.info.name} failed (${e.message?.take(200)}); using ${it.name}") }
+                    ?: return@map PluginLoader.failure(rec.info.name, e)
+            }
+            if (jar.absolutePath != rec.jarPath) mutex.withLock {
+                writeState(state.copy(installed = state.installed.map {
+                    if (it.info.internalName == rec.info.internalName && it.sha256 == rec.sha256) it.copy(jarPath = jar.absolutePath) else it
+                }))
+            }
             loader.load(rec.info.name, File(rec.cs3Path), jar)
+        }
+        mutex.withLock { deleteStaleJars() }
+        results
+    }
+
+    /**
+     * Drops converted jars no installed extension uses: older converter versions and versions replaced by an update.
+     * Only finished cache files (`<sha256>-c<N>.jar`); temp files of a conversion in progress are left alone.
+     */
+    private fun deleteStaleJars() {
+        val keep = state.installed.mapTo(HashSet()) { File(it.jarPath).name } +
+            state.installed.map { converter.jarFor(it.sha256).name }
+        val cacheName = Regex("[0-9a-f]{64}-c\\d+\\.jar")
+        File(root, "jars").listFiles()?.forEach { f ->
+            if (f.isFile && cacheName.matches(f.name) && f.name !in keep) {
+                if (f.delete()) log.info("Deleted unused converted jar ${f.name}")
+            }
         }
     }
 

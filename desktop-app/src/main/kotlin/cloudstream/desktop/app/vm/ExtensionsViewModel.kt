@@ -28,6 +28,8 @@ data class InstalledRow(
     val updateTo: PluginInfo? = null,
     /** What the safety check found (null = not checked yet / demo mode). */
     val safety: cloudstream.desktop.app.domain.ExtensionSafety? = null,
+    /** When the extension was installed or last updated (epoch ms; 0 = unknown). */
+    val updatedAt: Long = 0,
 ) {
     val hasSettingsUi: Boolean get() = (load as? LoadResult.Ok)?.hasSettingsUi == true
 }
@@ -44,6 +46,8 @@ data class ExtensionsState(
     val typeFilter: String? = null,
     val query: String = "",
     val startupLoading: Boolean = false,
+    /** False until the saved repositories / installed extensions were read (the screen shows a skeleton, not "none"). */
+    val listsLoaded: Boolean = false,
 ) {
     val installedNames: Set<String> get() = installed.map { it.info.internalName }.toSet()
 
@@ -93,10 +97,13 @@ class ExtensionsViewModel(
         val installed = backend.installed()
         _state.update { s ->
             s.copy(
+                listsLoaded = true,
                 repos = repos.map { r -> s.repos.firstOrNull { it.repo.url == r.url } ?: RepoSection(r) },
                 installed = installed.map { i ->
                     val old = s.installed.firstOrNull { it.info.internalName == i.info.internalName }
-                    InstalledRow(i.info, old?.load, safety = old?.safety)
+                    // The downloaded file is written on install and rewritten on update: its time is "updated at".
+                    val at = runCatching { java.io.File(i.dexPath).lastModified() }.getOrDefault(0L)
+                    InstalledRow(i.info, old?.load, safety = old?.safety, updatedAt = at)
                 },
             )
         }
@@ -223,7 +230,7 @@ class ExtensionsViewModel(
     fun update(internalName: String): Job = launchGuarded("Update") {
         setBusy(internalName, "Updating...")
         try {
-            backend.update(internalName)
+            try { backend.update(internalName) } catch (t: Throwable) { afterFailedUpdate(); throw t }
             refreshLists()
             loadOne(internalName)
             _state.update { s -> s.copy(message = "Updated $internalName") }
@@ -254,9 +261,20 @@ class ExtensionsViewModel(
                 _state.update { s -> s.copy(installed = s.installed.map { if (it.info.internalName == u.internalName) it.copy(updateTo = null) else it }) }
                 "Updated ${u.name}: v$from -> v${u.version}"
             } catch (e: CancellationException) { throw e } catch (t: Throwable) {
+                afterFailedUpdate()
                 "Update of ${u.name} failed: ${describe(t)}"
             } finally { setBusy(u.internalName, null); refreshSafety() }
         }
+    }
+
+    /**
+     * A failed update was rolled back by the repository: the new version's load unloaded the old one first, and the
+     * old one was then loaded again with fresh provider instances. Re-read the list and tell the app, or the UI keeps
+     * the unloaded instances and the extension's providers disappear until restart.
+     */
+    private suspend fun afterFailedUpdate() {
+        runCatching { refreshLists() }
+        onProvidersChanged()
     }
 
     fun checkUpdates(): Job = launchGuarded("Update check") {

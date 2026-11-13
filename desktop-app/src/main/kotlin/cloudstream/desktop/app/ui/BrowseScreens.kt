@@ -141,7 +141,7 @@ fun SearchScreen(c: AppController, focus: FocusRequester) {
             }
         }
         if (answered.size > 1) {
-            LazyRow(Modifier.padding(top = 8.dp), contentPadding = PaddingValues(horizontal = SidePad), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            ScrollRow(Modifier.padding(top = 8.dp), contentPadding = PaddingValues(horizontal = SidePad), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 item { Chip("All", only == null) { only = null } }
                 items(answered.map { it.provider }, key = { it }) { n -> Chip(n, only == n) { only = if (only == n) null else n } }
             }
@@ -200,7 +200,7 @@ private fun CardRow(
     items: List<MediaCard>, horizontal: Boolean = false, loadingMore: Boolean = false,
     onNearEnd: (() -> Unit)? = null, menu: ((MediaCard) -> List<CardMenuItem>)? = null, onClick: (MediaCard) -> Unit,
 ) {
-    LazyRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    ScrollRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         itemsIndexed(items, key = { _, it -> it.url }) { i, card ->
             if (onNearEnd != null && i >= items.size - 3) LaunchedEffect(items.size) { onNearEnd() }
             PosterCard(card, { onClick(card) }, width = 150.dp, horizontal = horizontal, menu = menu?.let { m -> { m(card) } })
@@ -285,7 +285,7 @@ private fun HomeContent(c: AppController, s: cloudstream.desktop.app.vm.HomeStat
         if (history.isNotEmpty()) item(key = "continue") {
             Column(Modifier.padding(top = 8.dp)) {
                 Box(Modifier.padding(horizontal = SidePad)) { RowTitle("Continue Watching") }
-                LazyRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                ScrollRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     items(history, key = { it.id }) { h ->
                         val ep = listOfNotNull(h.season?.let { "S$it" }, h.episode?.let { "E$it" }).joinToString(" ")
                         PosterCard(h.toCard(), { c.openDetails(h.toCard()) }, width = 150.dp, horizontal = true,
@@ -402,7 +402,7 @@ fun LibraryScreen(c: AppController) {
         Box(Modifier.padding(horizontal = SidePad)) { ScreenTitle("My List") }
         if (s.history.isNotEmpty()) {
             Box(Modifier.padding(horizontal = SidePad)) { RowTitle("Continue Watching") }
-            LazyRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            ScrollRow(contentPadding = PaddingValues(horizontal = SidePad, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 items(s.history, key = { it.id }) { h ->
                     val ep = listOfNotNull(h.season?.let { "S$it" }, h.episode?.let { "E$it" }).joinToString(" ")
                     PosterCard(h.toCard(), { c.openDetails(h.toCard()) }, width = 150.dp, horizontal = true, caption = ep.ifBlank { h.apiName },

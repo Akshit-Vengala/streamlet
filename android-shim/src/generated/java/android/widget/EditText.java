@@ -2,13 +2,15 @@
 package android.widget;
 
 public class EditText extends android.widget.TextView {
+    // Hand-edited: keeps its text (setText/getText) instead of returning null.
+    private final cloudstream.desktop.androidshim.TextBuffer text = new cloudstream.desktop.androidshim.TextBuffer(null);
     public EditText() { }
     public EditText(android.content.Context a0) { super(); cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.<init>"); }
     public void addTextChangedListener(android.text.TextWatcher a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.addTextChangedListener"); }
     public void clearFocus() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.clearFocus"); }
     public android.graphics.drawable.Drawable getBackground() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.getBackground"); return new android.graphics.drawable.Drawable(); }
     public int getId() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.getId"); return 0; }
-    public android.text.Editable getText() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.getText"); return null; }
+    public android.text.Editable getText() { return text; }
     public android.os.IBinder getWindowToken() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.getWindowToken"); return null; }
     public boolean requestFocus() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.requestFocus"); return false; }
     public void selectAll() { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.selectAll"); }
@@ -29,7 +31,7 @@ public class EditText extends android.widget.TextView {
     public void setPadding(int a0, int a1, int a2, int a3) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setPadding"); }
     public void setSelection(int a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setSelection"); }
     public void setSingleLine(boolean a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setSingleLine"); }
-    public void setText(java.lang.CharSequence a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setText"); }
+    public void setText(java.lang.CharSequence a0) { text.set(a0); }
     public void setTextColor(int a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setTextColor"); }
     public void setTextSize(float a0) { cloudstream.desktop.androidshim.Stub.hit("android.widget.EditText.setTextSize"); }
 }

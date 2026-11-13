@@ -120,6 +120,7 @@ internal fun translate(cs3: File, out: File, warnings: MutableCollection<String>
         .optimizeSynchronized(true).printIR(false).noCode(false)
         .skipExceptions(false).dontSanitizeNames(true)
     val nodes = translateToNodes(d, handler, sanitizeNames = false)
+    stubForeignComposeStability(nodes, warnings)
     splitOversized(nodes, warnings)
     ZipOutputStream(out.outputStream().buffered()).use { zo ->
         for (c in nodes) {
@@ -152,6 +153,28 @@ private fun translateToNodes(d: Dex2jar, handler: DexExceptionHandler, sanitizeN
         .newInstance(d, handler) as com.googlecode.d2j.dex.Dex2Asm
     asm.convertDex(fileNode, factory)
     return nodes
+}
+
+/**
+ * Extensions built with the Compose compiler read the static `$stable` field of every class they extend or embed,
+ * including app classes (Plugin, AniListApi.*, ...). Our shims are not compiled with Compose and have no such field,
+ * so loading fails with NoSuchFieldError. A read of `$stable` on a class outside the extension becomes `0` ("stable"):
+ * the value only feeds Compose's recomposition skipping, never extension logic.
+ */
+internal fun stubForeignComposeStability(nodes: List<ClassNode>, warnings: MutableCollection<String>) {
+    val own = nodes.mapTo(HashSet()) { it.name }
+    var n = 0
+    for (c in nodes) for (m in c.methods) {
+        val insns = m.instructions ?: continue
+        for (i in insns.toArray()) {
+            if (i is org.objectweb.asm.tree.FieldInsnNode && i.opcode == org.objectweb.asm.Opcodes.GETSTATIC &&
+                i.name == "\$stable" && i.desc == "I" && i.owner !in own
+            ) {
+                insns.set(i, org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.ICONST_0)); n++
+            }
+        }
+    }
+    if (n > 0) warnings += "Replaced $n read(s) of Compose \$stable on app classes with 0"
 }
 
 /** Methods over the JVM's 64 KB limit are split ([MethodSplitter]); if that fails they are stubbed (see LargeMethodStubber). */
@@ -198,4 +221,4 @@ private fun codeLength(c: ClassNode, m: MethodNode): Long {
 }
 
 /** Bump when conversion output changes (settings, post-processing) so cached jars are rebuilt. 3: LargeMethodStubber (code-length parser). */
-internal const val CONVERTER_VERSION = 5 // 5: MethodSplitter (oversized methods split instead of stubbed)
+internal const val CONVERTER_VERSION = 6 // 5: MethodSplitter (oversized methods split instead of stubbed). 6: foreign Compose $stable reads -> 0

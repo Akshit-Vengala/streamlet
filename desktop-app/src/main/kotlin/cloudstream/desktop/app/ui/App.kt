@@ -1,7 +1,12 @@
 package cloudstream.desktop.app.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
@@ -144,6 +149,23 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
     }
 }
 
+/** Shown in the window while the services start in the background (or the message when they could not). */
+@Composable
+fun StartupSplash(error: String?) {
+    CloudTheme {
+        Surface(Modifier.fillMaxSize(), color = Ink) {
+            Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                AppLogoImage(72.dp)
+                Spacer(Modifier.height(18.dp))
+                Text("Streamlet", color = Color.White, fontWeight = FontWeight.Black, fontSize = 26.sp)
+                Spacer(Modifier.height(22.dp))
+                if (error == null) androidx.compose.material3.LinearProgressIndicator(Modifier.width(180.dp), color = Accent, trackColor = Color.White.copy(0.12f))
+                else Text(error, color = Color(0xFFFF8A80), fontSize = 14.sp)
+            }
+        }
+    }
+}
+
 /** Floating top bar: logo, sections, profile. Fades from black so it can sit over the hero artwork. */
 @Composable
 private fun TopBar(c: AppController, root: Screen) {
@@ -153,23 +175,29 @@ private fun TopBar(c: AppController, root: Screen) {
             .padding(horizontal = 32.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(24.dp), verticalAlignment = Alignment.CenterVertically) {
-            AppLogoImage(30.dp, Modifier.clickable { c.goTo(Screen.Home) })
+        Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+            AppLogoImage(30.dp, Modifier.clip(RoundedCornerShape(6.dp)).clickable { c.goTo(Screen.Home) })
+            Spacer(Modifier.width(18.dp))
             navItems.forEach { item -> NavLink(item.label, root == item.screen) { c.goTo(item.screen) } }
         }
         ProfileRailButton(c)
     }
 }
 
+/** A pill: soft highlight on hover, a filled pill with an accent underline when it is the current section. */
 @Composable
 private fun NavLink(label: String, selected: Boolean, onClick: () -> Unit) {
     val src = remember { MutableInteractionSource() }
     val hovered by src.collectIsHoveredAsState()
-    Text(
-        label,
-        Modifier.hoverable(src).clickable(onClick = onClick),
-        color = when { selected -> Color.White; hovered -> Color(0xFFD0D0D0); else -> Color(0xFF9A9AA2) },
-        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-        fontSize = 15.sp,
-    )
+    val bg by animateColorAsState(when { selected -> Color.White.copy(0.14f); hovered -> Color.White.copy(0.08f); else -> Color.Transparent }, tween(150))
+    val fg by animateColorAsState(when { selected -> Color.White; hovered -> Color(0xFFE6E6EA); else -> Color(0xFFA0A0AA) }, tween(150))
+    Box(
+        Modifier.clip(RoundedCornerShape(20.dp)).background(bg)
+            .hoverable(src).clickable(interactionSource = src, indication = null, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = fg, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, fontSize = 14.sp, letterSpacing = 0.2.sp)
+        if (selected) Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 2.dp).width(18.dp).height(2.dp).clip(RoundedCornerShape(1.dp)).background(Accent))
+    }
 }

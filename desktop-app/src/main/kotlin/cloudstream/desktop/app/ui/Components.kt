@@ -15,6 +15,11 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.isShiftPressed
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.animateScrollBy
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -335,7 +340,11 @@ fun PrimaryButton(text: String, onClick: () -> Unit, enabled: Boolean = true, le
         onClick, enabled = enabled, shape = RoundedCornerShape(4.dp),
         colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 22.dp, vertical = 10.dp),
-    ) { Text((leading?.let { "$it  " } ?: "") + text, fontWeight = FontWeight.Bold, fontSize = 16.sp) }
+    ) {
+        // The default play arrow is drawn (a text "▶" sits low and off-centre next to the label).
+        if (leading == "▶") { GlyphIcon(Glyph.Play, 16.dp, Color.Black); Box(Modifier.width(10.dp)) }
+        Text((leading?.takeIf { it != "▶" }?.let { "$it  " } ?: "") + text, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+    }
 }
 
 /** Translucent grey secondary button ("More info", "My List"). */
@@ -397,3 +406,53 @@ fun ScreenTitle(text: String, trailing: @Composable () -> Unit = {}) {
 
 @Composable
 fun Dot(color: Color, size: Dp = 8.dp) = Box(Modifier.size(size).clip(RoundedCornerShape(50)).background(color))
+
+/**
+ * A horizontally scrolling row with mouse-friendly scrolling: the wheel scrolls it sideways while Shift is held (and
+ * trackpads / tilt wheels already do), and hovering shows ‹ › arrows at the edges that page the row.
+ */
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+fun ScrollRow(
+    modifier: Modifier = Modifier,
+    contentPadding: androidx.compose.foundation.layout.PaddingValues = androidx.compose.foundation.layout.PaddingValues(0.dp),
+    horizontalArrangement: Arrangement.Horizontal = Arrangement.Start,
+    content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit,
+) {
+    val state = androidx.compose.foundation.lazy.rememberLazyListState()
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val src = remember { MutableInteractionSource() }
+    val hovered by src.collectIsHoveredAsState()
+    Box(
+        modifier.hoverable(src)
+        // One-handed: press on the row and drag sideways (a plain click still opens the card).
+        .dragToScroll(state, scope)
+        .onPointerEvent(
+            androidx.compose.ui.input.pointer.PointerEventType.Scroll, androidx.compose.ui.input.pointer.PointerEventPass.Initial,
+        ) { e ->
+            if (e.keyboardModifiers.isShiftPressed) {
+                val d = e.changes.firstOrNull()?.scrollDelta ?: return@onPointerEvent
+                val amount = (if (d.x != 0f) d.x else d.y) * 90f
+                e.changes.forEach { it.consume() }
+                scope.launch { state.scrollBy(amount) }
+            }
+        },
+    ) {
+        androidx.compose.foundation.lazy.LazyRow(state = state, contentPadding = contentPadding, horizontalArrangement = horizontalArrangement, content = content)
+        @Composable fun Arrow(glyph: Glyph, align: Alignment, enabled: Boolean, dir: Int) {
+            if (hovered && enabled) Box(
+                Modifier.align(align).padding(horizontal = 10.dp).size(40.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                    .background(Color.Black.copy(0.72f)).border(1.dp, Color.White.copy(0.25f), androidx.compose.foundation.shape.CircleShape)
+                    .clickable { scope.launch { state.animateScrollBy(dir * state.layoutInfo.viewportSize.width * 0.8f) } },
+                contentAlignment = Alignment.Center,
+            ) { GlyphIcon(glyph, 22.dp) }
+        }
+        Arrow(Glyph.ChevronLeft, Alignment.CenterStart, state.canScrollBackward, -1)
+        Arrow(Glyph.ChevronRight, Alignment.CenterEnd, state.canScrollForward, 1)
+    }
+}
+
+private fun Modifier.dragToScroll(state: androidx.compose.foundation.lazy.LazyListState, scope: kotlinx.coroutines.CoroutineScope): Modifier = composed {
+    val drag = androidx.compose.foundation.gestures.rememberDraggableState { delta -> scope.launch { state.scrollBy(-delta) } }
+    this.draggable(drag, androidx.compose.foundation.gestures.Orientation.Horizontal)
+}

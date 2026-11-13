@@ -426,7 +426,7 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
                     CircularProgressIndicator(Modifier.size(64.dp), color = Red)
                     st.bufferPercent?.let { Text("$it%", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                 }
-                else RoundButton(if (st.playing) "❚❚" else "▶", 84) { ui.togglePlay(); poke() }
+                else RoundButton(if (st.playing) "❚❚" else "▶", 84, glyph = if (st.playing) Glyph.Pause else Glyph.Play) { ui.togglePlay(); poke() }
                 RoundButton("↻\n${fwd / 1000}", 64) { ui.onSeekBy(fwd); poke() }
             }
 
@@ -456,6 +456,7 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
                     PlayerIconButton("☰  Source") { dialog = "sources" }
                     if (ui.videoList.size > 1) PlayerIconButton("▣  Video: ${ui.videoList.firstOrNull { it.selected }?.title?.substringBefore(" ·") ?: "Auto"}") { dialog = "video" }
                     if (ui.audioList.size > 1) PlayerIconButton("♪  Audio") { dialog = "audio" }
+                    ui.skip?.let { seg -> PlayerIconButton("⏩  ${seg.kind.label}") { ui.onSkip() } }
                     if (ui.hasNext) PlayerIconButton("⏭  Next episode") { ui.onNext() }
                 }
                 st.error?.let { Text(it, color = Color(0xFFFF8A80), fontSize = 12.sp, maxLines = 2, modifier = Modifier.align(Alignment.CenterHorizontally)) }
@@ -471,7 +472,13 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
             Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = if (alpha > 0.5f) 150.dp else 48.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically,
         ) {
-            ui.skip?.let { seg -> PromptButton(seg.kind.label + "  ›", primary = false) { ui.onSkip() } }
+            ui.skip?.let { seg ->
+                // Fades away 5 s after it appears (restarts for each new segment); the bottom-bar button stays until the segment ends.
+                var faded by remember(seg) { mutableStateOf(false) }
+                LaunchedEffect(seg) { delay(5_000); faded = true }
+                val a by animateFloatAsState(if (faded) 0f else 1f, tween(600))
+                if (a > 0f) Box(Modifier.alpha(a)) { PromptButton(seg.kind.label + "  ›", primary = false) { ui.onSkip() } }
+            }
             val next = ui.autoNextIn
             if (ui.hasNext && next != null) {
                 PromptButton("Cancel", primary = false) { ui.onCancelAutoNext() }
@@ -910,11 +917,11 @@ private fun PlayerIconButton(label: String, modifier: Modifier = Modifier, onCli
 }
 
 @Composable
-private fun RoundButton(label: String, size: Int, onClick: () -> Unit) {
+private fun RoundButton(label: String, size: Int, glyph: Glyph? = null, onClick: () -> Unit) {
     Box(
         Modifier.size(size.dp).clip(CircleShape).background(Color.Black.copy(0.35f)).clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
-    ) { Text(label, color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size / 3.2).sp, lineHeight = (size / 3.2).sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
+    ) { if (glyph != null) GlyphIcon(glyph, (size * 0.42f).dp) else Text(label, color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size / 3.2).sp, lineHeight = (size / 3.2).sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
 }
 
 /** Dim backdrop + centred panel (dialogs stay inside the overlay window, above the video). */

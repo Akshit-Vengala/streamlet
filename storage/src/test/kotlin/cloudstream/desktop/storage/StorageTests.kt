@@ -92,6 +92,15 @@ class StorageTests {
     }
 
     @Test
+    fun markedWatchedResumePointReadsBack() {
+        val lib = StorageManager(tmpDir(), 0).library
+        lib.setResume(ResumePoint.markedWatched("e1", 5))
+        assertEquals(true, lib.resume("e1")?.watched)
+        lib.setResume(ResumePoint.cleared("e1", 6))
+        assertEquals(false, lib.resume("e1")?.watched)
+    }
+
+    @Test
     fun bookmarkStatusPersistsAndOldEntriesReadAsPlanToWatch() {
         val sm = StorageManager(tmpDir(), 0)
         sm.library.setBookmark(Bookmark("1", "A", "api", "u", null, null, 1, cloudstream.desktop.contracts.WatchStatus.Dropped))

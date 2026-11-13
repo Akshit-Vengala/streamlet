@@ -1,5 +1,7 @@
 package cloudstream.desktop.app.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -102,14 +105,17 @@ fun ExtensionsScreen(c: AppController) {
                     val gs = c.services.globalSettings
                     val mode by gs.extUpdates.collectAsStateCompat()
                     Dropdown(mode.label, cloudstream.desktop.app.ExtUpdateMode.entries.toList(), { it.label }) { gs.setExtUpdates(it) }
-                    OutlinedButton(onClick = {
+                    Button(onClick = {
                         c.services.scope.launch { vm.applyUpdates(install = true).ifEmpty { listOf("All extensions are up to date") }.forEach { c.services.toast(it) } }
-                    }) { Text("Update now") }
+                    }, shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp)) { Text("⟳  Update now", fontWeight = FontWeight.SemiBold) }
                 }
             }
             if (s.startupLoading) { Spacer8(); LinearProgressIndicator(Modifier.fillMaxWidth()); Text("Loading installed extensions...", style = MaterialTheme.typography.bodySmall) }
         }
-        if (s.installed.isEmpty() && !s.startupLoading) {
+        if (!s.listsLoaded) {
+            // Skeleton cards until the saved extensions are read (never "No extensions" for a moment).
+            item { Column(Modifier.fillMaxWidth().shimmer(), verticalArrangement = Arrangement.spacedBy(10.dp)) { repeat(3) { ExtensionSkeleton() } } }
+        } else if (s.installed.isEmpty() && !s.startupLoading) {
             item { Text("No extensions installed yet. Add a repository and install some below.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
         items(s.installed, key = { "i:" + it.info.internalName }) { row -> InstalledRowView(row, s.busy[row.info.internalName], vm) }
@@ -160,9 +166,19 @@ private fun FilterBar(s: ExtensionsState, vm: ExtensionsViewModel) {
 @Composable
 fun <T> Dropdown(current: String, options: List<T>, label: (T) -> String, onPick: (T) -> Unit) {
     var open by remember { mutableStateOf(false) }
+    // A select field (label + chevron), deliberately unlike the filled action buttons next to it.
     Box {
-        OutlinedButton(onClick = { open = true }) { Text(current) }
-        DropdownMenu(open, { open = false }) {
+        Row(
+            Modifier.clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                .clickable { open = true }.padding(start = 14.dp, end = 10.dp, top = 9.dp, bottom = 9.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(current, style = MaterialTheme.typography.bodyMedium)
+            Text("▾", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        DropdownMenu(open, { open = false }, containerColor = Color(0xFF202027)) {
             options.forEach { o -> DropdownMenuItem(text = { Text(label(o)) }, onClick = { open = false; onPick(o) }) }
         }
     }
@@ -194,6 +210,21 @@ private fun AvailableRow(p: PluginInfo, installed: Boolean, busy: String?, vm: E
 }
 
 @Composable
+private fun ExtensionSkeleton() {
+    Row(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.surfaceContainer).padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ShimmerBlock(Modifier.width(180.dp).height(16.dp), corner = 4.dp)
+            ShimmerBlock(Modifier.width(110.dp).height(11.dp), corner = 4.dp)
+            ShimmerBlock(Modifier.width(300.dp).height(11.dp), corner = 4.dp)
+        }
+        ShimmerBlock(Modifier.width(150.dp).height(30.dp), corner = 8.dp)
+    }
+}
+
+private val updatedFormat = java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm")
+
+@Composable
 private fun InstalledRowView(row: InstalledRow, busy: String?, vm: ExtensionsViewModel) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -205,6 +236,10 @@ private fun InstalledRowView(row: InstalledRow, busy: String?, vm: ExtensionsVie
                     if (row.hasSettingsUi) Badge("Settings unavailable on desktop", WarnAmber.copy(alpha = 0.25f), MaterialTheme.colorScheme.onSurface)
                     row.updateTo?.let { Badge("update: v${it.version}", MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.onPrimaryContainer) }
                 }
+                if (row.updatedAt > 0) Text(
+                    "Updated " + java.time.Instant.ofEpochMilli(row.updatedAt).atZone(java.time.ZoneId.systemDefault()).format(updatedFormat),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 when (val l = row.load) {
                     null -> Row(verticalAlignment = Alignment.CenterVertically) { Dot(MaterialTheme.colorScheme.outline); Text("  Not loaded", style = MaterialTheme.typography.bodySmall) }
                     is LoadResult.Ok -> LoadedSummary(l.apis)

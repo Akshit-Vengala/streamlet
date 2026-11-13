@@ -97,34 +97,58 @@ fun main(argv: Array<String>) {
     argv.indexOf("--sync-probe").takeIf { it >= 0 }?.let { exitProcess(cloudstream.desktop.app.sync.SyncProbe.run(File(argv.getOrElse(it + 1) { "sync-probe" }))) }
     if (args.screenshots != null) exitProcess(Screenshots.run(args.screenshots))
 
-    if (!ClasspathCheck.verify() && !args.fakes) {
-        System.err.println("Refusing to start with the real modules: fix the classpath order (see above).")
-        exitProcess(3)
-    }
-    val services = if (args.fakes) AppServices.fakes(seedInstalled = true)
-    else AppServices.real(AppServices.appRoot(args.dataDir))
-    val controller = AppController(services)
-    AppLog.get("app").info("Services ready (${services.mode})")
-    // DNS over HTTPS for the extensions' HTTP client: now, and whenever it is changed in Settings.
-    if (services.mode == AppServices.Mode.Real) services.scope.launch {
-        services.globalSettings.dnsProvider.collect { p ->
-            runCatching { cloudstream.desktop.webview.NetworkDns.apply(p) }
-                .onSuccess { AppLog.get("network").info("DNS: ${p.label}") }
-                .onFailure { AppLog.get("network").warning("DNS ${p.label} not applied: $it") }
+    // The window opens at once with a splash; the services (storage, extension loader, ...) are built on a background
+    // thread and the app appears when they are ready.
+    val root = AppServices.appRoot(args.dataDir)
+    val holder = mutableStateOf<AppController?>(null)
+    val startupError = mutableStateOf<String?>(null)
+    Thread({
+        try {
+            if (!ClasspathCheck.verify() && !args.fakes) {
+                System.err.println("Refusing to start with the real modules: fix the classpath order (see above).")
+                startupError.value = "Streamlet could not start: its libraries are in the wrong order (see the log)."
+                return@Thread
+            }
+            val services = if (args.fakes) AppServices.fakes(seedInstalled = true) else AppServices.real(root)
+            val controller = AppController(services)
+            AppLog.get("app").info("Services ready (${services.mode})")
+            // DNS over HTTPS for the extensions' HTTP client: now, and whenever it is changed in Settings.
+            if (services.mode == AppServices.Mode.Real) services.scope.launch {
+                services.globalSettings.dnsProvider.collect { p ->
+                    runCatching { cloudstream.desktop.webview.NetworkDns.apply(p) }
+                        .onSuccess { AppLog.get("network").info("DNS: ${p.label}") }
+                        .onFailure { AppLog.get("network").warning("DNS ${p.label} not applied: $it") }
+                }
+            }
+            AppLog.startFreezeWatch()
+            if (!args.fakes) Thread({ runCatching { DiskCleanup.run() }.onFailure { AppLog.get("cleanup").warning("Cleanup failed: $it") } }, "disk-cleanup")
+                .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
+            holder.value = controller
+        } catch (t: Throwable) {
+            AppLog.get("app").severe("Startup failed: $t")
+            startupError.value = "Streamlet could not start: ${t.message ?: t::class.simpleName}"
         }
-    }
-    AppLog.startFreezeWatch()
-    if (!args.fakes) Thread({ runCatching { DiskCleanup.run() }.onFailure { AppLog.get("cleanup").warning("Cleanup failed: $it") } }, "disk-cleanup")
-        .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }.start()
-    runWindow(controller)
+    }, "startup").apply { isDaemon = true }.start()
+    runWindow(holder, startupError, File(root, "window.txt"))
     AppLog.get("app").info("Window closed, shutting down")
-    services.close()
+    holder.value?.services?.close()
     exitProcess(0)
 }
 
+/** Window size / position, kept in a tiny file so the window can open before the settings store is loaded. */
+private fun readWindowFile(f: File): WindowPrefs? = runCatching {
+    val p = f.readText().trim().split(',')
+    WindowPrefs(p[0].toInt(), p[1].toInt(), p[2].toIntOrNull(), p[3].toIntOrNull(), p[4] == "1")
+}.getOrNull()
+
+private fun writeWindowFile(f: File, w: WindowPrefs) {
+    runCatching { f.writeText("${w.width},${w.height},${w.x ?: ""},${w.y ?: ""},${if (w.maximized) 1 else 0}") }
+}
+
 @OptIn(FlowPreview::class)
-private fun runWindow(c: AppController) = application(exitProcessOnExit = false) {
-    val saved = c.services.globalSettings.window()
+private fun runWindow(holder: androidx.compose.runtime.State<AppController?>, startupError: androidx.compose.runtime.State<String?>, windowFile: File) = application(exitProcessOnExit = false) {
+    val c = holder.value
+    val saved = remember { readWindowFile(windowFile) }
     val state = remember {
         WindowState(
             size = DpSize((saved?.width ?: 1280).dp, (saved?.height ?: 800).dp),
@@ -132,15 +156,25 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
             placement = if (saved?.maximized == true) WindowPlacement.Maximized else WindowPlacement.Floating,
         )
     }
-    LaunchedEffect(Unit) { c.start() }
+    LaunchedEffect(c) { c?.start() }
+    // First run after the window file existed nowhere: take the size from the settings store once it is loaded.
+    LaunchedEffect(c) {
+        if (c != null && saved == null) c.services.globalSettings.window()?.let {
+            state.size = DpSize(it.width.dp, it.height.dp)
+            if (it.x != null && it.y != null) state.position = WindowPosition(it.x.dp, it.y.dp)
+            if (it.maximized) state.placement = WindowPlacement.Maximized
+        }
+    }
     // Window-state persistence (debounced; not while in the player's fullscreen).
-    LaunchedEffect(state) {
+    LaunchedEffect(state, c) {
         snapshotFlow { Triple(state.size, state.position, state.placement) }.debounce(500).collect { (size, pos, placement) ->
-            if (placement != WindowPlacement.Fullscreen && !c.fullscreen.value) c.services.globalSettings.saveWindow(
-                WindowPrefs(size.width.value.toInt(), size.height.value.toInt(),
+            if (placement != WindowPlacement.Fullscreen && c?.fullscreen?.value != true) {
+                val prefs = WindowPrefs(size.width.value.toInt(), size.height.value.toInt(),
                     pos.takeIf { it.isSpecified }?.x?.value?.toInt(), pos.takeIf { it.isSpecified }?.y?.value?.toInt(),
-                    placement == WindowPlacement.Maximized),
-            )
+                    placement == WindowPlacement.Maximized)
+                writeWindowFile(windowFile, prefs)
+                c?.services?.globalSettings?.saveWindow(prefs)
+            }
         }
     }
     val searchFocus = remember { FocusRequester() }
@@ -150,8 +184,9 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
         onCloseRequest = ::exitApplication,
         state = state,
         icon = cloudstream.desktop.app.ui.AppLogo.painter,
-        title = "Streamlet" + if (c.services.mode == AppServices.Mode.Fakes) " (fake data)" else "",
+        title = "Streamlet" + if (c?.services?.mode == AppServices.Mode.Fakes) " (fake data)" else "",
         onPreviewKeyEvent = { e ->
+            val c = holder.value ?: return@Window false
             // The player (when open) gets every key first, whatever has focus. The release of a key it handled is
             // swallowed too: otherwise a focused button (e.g. the play button just clicked) "clicked" on Space's
             // release and undid the pause.
@@ -181,7 +216,8 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
         LaunchedEffect(wantSearchFocus) { if (wantSearchFocus > 0) runCatching { kotlinx.coroutines.delay(100); searchFocus.requestFocus() } }
         // Borderless fullscreen (like VLC / browsers), NOT Java's exclusive full-screen mode: that one minimised the
         // window on Alt+Tab and left it "always on top" and impossible to switch back to.
-        LaunchedEffect(Unit) {
+        LaunchedEffect(c) {
+            if (c == null) return@LaunchedEffect
             var saved: Pair<java.awt.Rectangle, Int>? = null
             c.fullscreen.collect { fs ->
                 val w = window
@@ -213,6 +249,6 @@ private fun runWindow(c: AppController) = application(exitProcessOnExit = false)
                 }
             }
         }
-        AppRoot(c, searchFocus)
+        if (c != null) AppRoot(c, searchFocus) else cloudstream.desktop.app.ui.StartupSplash(startupError.value)
     }
 }

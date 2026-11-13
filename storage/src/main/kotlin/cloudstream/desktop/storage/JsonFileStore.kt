@@ -14,7 +14,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
+// Computed getters (ResumePoint.watched / startMs) are written out too; reading them back must not fail on them.
 internal val sharedMapper: ObjectMapper = jacksonObjectMapper()
+    .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
 /** Default data dir: `<AppDirs.root>/data` (%APPDATA% on Windows, XDG data dir on Linux). */
 fun defaultDataDir(): File = File(cloudstream.desktop.contracts.AppDirs.root, "data")

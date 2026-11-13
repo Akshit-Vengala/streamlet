@@ -142,7 +142,7 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
                     if (d.recommendations.isNotEmpty()) {
                         item { Box(Modifier.padding(start = 48.dp, top = 28.dp)) { RowTitle("More Like This") } }
                         item {
-                            LazyRow(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 48.dp, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            ScrollRow(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 48.dp, vertical = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 items(d.recommendations, key = { it.url }) { r -> PosterCard(r, { c.openDetails(r) }, width = 140.dp, menu = { libraryMenu(c, r) }) }
                             }
                         }
@@ -263,7 +263,7 @@ private fun EpisodeRow(
         Box(Modifier.width(176.dp).height(99.dp).clip(RoundedCornerShape(6.dp))) {
             RemoteImage(ep.posterUrl ?: fallbackThumb, Modifier.fillMaxSize(), placeholderText = ep.label)
             if (hovered) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)), contentAlignment = Alignment.Center) {
-                Text("▶", color = Color.White, fontSize = 30.sp)
+                GlyphIcon(Glyph.Play, 30.dp)
             }
             if (progress != null) {
                 Box(Modifier.fillMaxWidth().height(4.dp).align(Alignment.BottomCenter).background(Color.White.copy(alpha = 0.25f)))
