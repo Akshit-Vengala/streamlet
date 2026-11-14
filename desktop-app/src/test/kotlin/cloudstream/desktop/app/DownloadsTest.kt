@@ -29,6 +29,9 @@ class DownloadsTest {
         val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47) + ByteArray(60) + ts
         assertContentEquals(ts, Downloads.stripFakeHeader(png))
         assertContentEquals(ts, Downloads.stripFakeHeader(ts))
+        // An MP4 fragment whose payload happens to hold a TS sync pattern is left untouched.
+        val frag = FakeFmp4.box("moof", ByteArray(800) { b -> if (b % 188 == 10) 0x47 else 3 })
+        assertContentEquals(frag, Downloads.stripFakeHeader(frag))
     }
 
     private fun server(routes: Map<String, (Map<String, String>) -> Pair<Int, ByteArray>>): HttpServer =
@@ -120,7 +123,8 @@ class DownloadsTest {
             assertEquals(720, get(720, "b").quality)
             assertEquals(360, get(480, "c").quality)
             assertEquals(2160, get(0, "d").quality, "\"Best available\" takes the highest")
-            assertTrue("2160" in hits && hits.count { it == "2160" } == 1, "4K fetched only for the Best-available download: $hits")
+            // Each download reads its media playlist twice (segment list, then the #EXT-X-MAP check).
+            assertTrue(hits.count { it == "2160" } == 2, "4K fetched only for the Best-available download: $hits")
         } finally { srv.stop(0); scope.cancel(); tmp.deleteRecursively() }
     }
 
@@ -158,6 +162,81 @@ class DownloadsTest {
             assertContentEquals(segs.reduce { a, b -> a + b }, File(done.file).readBytes())
             assertEquals(5, done.segmentsTotal)
             assertTrue(done.file.endsWith("Film${File.separator}Film.ts"), done.file)
+        } finally { srv.stop(0); scope.cancel(); tmp.deleteRecursively() }
+    }
+
+    @Test fun `changing the folder mid-download moves the unfinished download, not the finished one`() {
+        val video = ByteArray(2_000_000) { (it % 241).toByte() }
+        val gate = java.util.concurrent.CountDownLatch(1)
+        val srv = server(mapOf(
+            "/done.mp4" to { _ -> 200 to video },
+            "/v.mp4" to { h ->
+                val from = h["range"]?.removePrefix("bytes=")?.substringBefore('-')?.toInt()
+                if (from != null) 206 to video.copyOfRange(from, video.size)
+                else { gate.await(10, java.util.concurrent.TimeUnit.SECONDS); 200 to video } // held until the folder changed
+            },
+            "/en.vtt" to { _ -> 200 to "WEBVTT\n".toByteArray() },
+        ))
+        val tmp = Files.createTempDirectory("dl").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val base = "http://127.0.0.1:${srv.address.port}"
+            var folder = File(tmp, "old")
+            val d = Downloads(File(tmp, "downloads.json"), scope) { folder }
+            val card = MediaCard("Prov", "Show", "https://show", null)
+            fun link(p: String) = SourceLink("Src", "Src", "$base/$p", "", 1080, emptyMap(), false, false)
+            d.start(card, "Show", false, EpisodeItem("e1", "One", 1, 1, null, null), link("done.mp4"), emptyList())
+            val finished = waitFor(d, cloudstream.desktop.app.vm.episodeId("Prov", "e1")) { it.status == DownloadItem.Status.Done }
+            d.start(card, "Show", false, EpisodeItem("e2", "Two", 1, 2, null, null), link("v.mp4"), listOf(SubtitleItem("English", "$base/en.vtt", emptyMap())))
+            val id = cloudstream.desktop.app.vm.episodeId("Prov", "e2")
+            waitFor(d, id) { it.status == DownloadItem.Status.Downloading && it.subtitles.orEmpty().isNotEmpty() }
+
+            folder = File(tmp, "new")
+            d.relocate()
+            waitFor(d, id) { it.file.startsWith(folder.path) }
+            gate.countDown()
+            val done = waitFor(d, id) { it.status == DownloadItem.Status.Done || it.status == DownloadItem.Status.Failed }
+            assertEquals(DownloadItem.Status.Done, done.status, done.error)
+            assertEquals(File(folder, "Show${File.separator}S1 E2 - Two.mp4").path, done.file)
+            assertContentEquals(video, File(done.file).readBytes())
+            val sub = done.subtitles.orEmpty().single()
+            assertTrue(sub.path.startsWith(folder.path) && File(sub.path).isFile, sub.path)
+            assertEquals(finished.file, d.byId(finished.id)!!.file, "a finished download stays where it is")
+            assertTrue(File(finished.file).isFile)
+        } finally { gate.countDown(); srv.stop(0); scope.cancel(); tmp.deleteRecursively() }
+    }
+
+    @Test fun `fmp4 hls is saved as a plain mp4`() {
+        val init = FakeFmp4.init
+        val parts = (0 until 3).map { FakeFmp4.segment(it) }
+        val segs = parts.map { it.second }
+        val media = buildString {
+            append("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n")
+            segs.indices.forEach { append("#EXTINF:4.0,\nseg$it.jpg\n") }
+            append("#EXT-X-ENDLIST\n")
+        }
+        val routes = HashMap<String, (Map<String, String>) -> Pair<Int, ByteArray>>()
+        routes["/v/index.m3u8"] = { _ -> 200 to media.toByteArray() }
+        routes["/v/init.mp4"] = { _ -> 200 to init }
+        segs.forEachIndexed { i, b -> routes["/v/seg$i.jpg"] = { _ -> 200 to b } }
+        val srv = server(routes)
+        val tmp = Files.createTempDirectory("dl").toFile()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val d = Downloads(File(tmp, "downloads.json"), scope) { File(tmp, "out") }
+            val link = SourceLink("Hls", "Hls", "http://127.0.0.1:${srv.address.port}/v/index.m3u8", "", 0, emptyMap(), true, false)
+            d.start(MediaCard("P", "Film", "u", null), "Film", true, EpisodeItem("m", "Movie", null, null, null, null), link, emptyList())
+            val id = cloudstream.desktop.app.vm.episodeId("P", "m")
+            val done = waitFor(d, id) { it.status == DownloadItem.Status.Done || it.status == DownloadItem.Status.Failed }
+            assertEquals(DownloadItem.Status.Done, done.status, done.error)
+            assertTrue(done.file.endsWith("Film${File.separator}Film.mp4"), done.file)
+            val out = File(done.file).readBytes()
+            // The init segment was fetched (moov present) and the fragments became one plain MP4 holding every sample.
+            assertEquals(listOf("ftyp", "moov", "mdat"), FakeFmp4.topTypes(out))
+            val samples = parts.flatMap { it.first }.reduce { a, b -> a + b }
+            assertContentEquals(samples, out.copyOfRange(out.size - samples.size, out.size))
+            assertTrue(!File(done.file.dropLast(4) + ".ts").exists())
+            assertTrue(!File(done.file + ".part").exists())
         } finally { srv.stop(0); scope.cancel(); tmp.deleteRecursively() }
     }
 }

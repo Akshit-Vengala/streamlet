@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import cloudstream.desktop.app.AppController
 import cloudstream.desktop.app.DownloadItem
+import cloudstream.desktop.app.downloadable
 import cloudstream.desktop.app.domain.EpisodeItem
 import cloudstream.desktop.app.domain.MediaDetails
 import cloudstream.desktop.app.domain.Outcome
@@ -95,7 +96,7 @@ fun sizeText(bytes: Long): String = when {
 /** What a download is doing, in one line. */
 fun statusText(d: DownloadItem): String = when (d.status) {
     DownloadItem.Status.Queued -> "Waiting…"
-    DownloadItem.Status.Downloading -> listOfNotNull(
+    DownloadItem.Status.Downloading -> d.error ?: listOfNotNull(
         d.progress?.let { "${(it * 100).toInt()}%" },
         sizeText(d.bytes).takeIf { it.isNotEmpty() }?.let { s -> if (d.total > 0) "$s of ${sizeText(d.total)}" else s },
         if (d.segmentsTotal > 0) "segment ${d.segmentsDone}/${d.segmentsTotal}" else null,
@@ -110,20 +111,36 @@ fun statusText(d: DownloadItem): String = when (d.status) {
  * the user pick one and the subtitles to keep (the preferred language ticked).
  */
 @Composable
-fun DownloadDialog(c: AppController, vm: DetailsViewModel, d: MediaDetails, ep: EpisodeItem, onClose: () -> Unit) {
+fun DownloadDialog(c: AppController, vm: DetailsViewModel, d: MediaDetails, ep: EpisodeItem, onClose: () -> Unit) =
+    DownloadDialog(c, vm.card, d, ep, onClose = onClose)
+
+/**
+ * [batch]: "download season": the other episodes to fetch from the source picked here. [prompt]: an episode of such a
+ * batch whose links lacked that source (its links are already known: no lookup), to pick another or skip.
+ */
+@Composable
+fun DownloadDialog(
+    c: AppController, card: cloudstream.desktop.app.domain.MediaCard, d: MediaDetails, ep: EpisodeItem,
+    batch: List<EpisodeItem> = emptyList(), prompt: cloudstream.desktop.app.SeasonDownloads.Prompt? = null, onClose: () -> Unit,
+) {
     val settings = c.services.settings
-    val links = remember { mutableStateListOf<SourceLink>() }
-    val subs = remember { mutableStateListOf<SubtitleItem>() }
-    val picked = remember { mutableStateListOf<String>() } // subtitle urls
-    var searching by remember { mutableStateOf(true) }
-    var message by remember { mutableStateOf<String?>(null) }
+    val links = remember(ep.data) { mutableStateListOf<SourceLink>().apply { prompt?.let { addAll(it.links) } } }
+    val subs = remember(ep.data) { mutableStateListOf<SubtitleItem>().apply { prompt?.let { addAll(it.subtitles) } } }
+    // subtitle urls; a prompt ticks the languages picked for the batch
+    val picked = remember(ep.data) { mutableStateListOf<String>().apply { prompt?.let { p -> addAll(p.choice.subtitles(p.subtitles).map { it.url }) } } }
+    var searching by remember(ep.data) { mutableStateOf(prompt == null) }
+    var message by remember(ep.data) { mutableStateOf<String?>(null) }
     val pref = settings.subtitleLang.value
     LaunchedEffect(ep.data) {
-        val p = c.providerByName(vm.card.provider)
+        if (prompt != null) return@LaunchedEffect
+        val p = c.providerByName(card.provider)
         if (p == null) { message = "Provider is not loaded"; searching = false; return@LaunchedEffect }
+        // Link lookups call back on worker threads; the state lists are read (iterated, sorted) during composition, so
+        // they are only changed on the UI thread. Changing them from a worker crashed the app (ConcurrentModification).
+        // invokeLater keeps the order: every callback is queued before this effect resumes after loadLinks.
         val out = guarded(p.linksTimeoutMs) {
-            p.loadLinks(ep.data, { l -> synchronized(links) { if (links.none { it.url == l.url }) links += l } }, { s ->
-                synchronized(subs) {
+            p.loadLinks(ep.data, { l -> javax.swing.SwingUtilities.invokeLater { if (links.none { it.url == l.url }) links += l } }, { s ->
+                javax.swing.SwingUtilities.invokeLater {
                     if (subs.none { it.url == s.url }) {
                         subs += s
                         // Preferred language ticked by default (one per language name).
@@ -140,11 +157,15 @@ fun DownloadDialog(c: AppController, vm: DetailsViewModel, d: MediaDetails, ep: 
         }
     }
     fun download(l: SourceLink) {
-        c.services.downloads.start(vm.card, d.name, d.isMovie, ep, l, subs.filter { it.url in picked }, maxQuality = settings.defaultQuality.value)
-        c.services.toast("Downloading ${if (d.isMovie) d.name else ep.label} (${l.source.ifBlank { l.name }}, ${l.qualityLabel})")
+        val chosenSubs = subs.filter { it.url in picked }
+        c.services.downloads.start(card, d.name, d.isMovie, ep, l, chosenSubs, maxQuality = settings.defaultQuality.value)
+        if (batch.isNotEmpty()) {
+            c.seasonDownloads.start(card, d, batch, cloudstream.desktop.app.SourceChoice.of(l, chosenSubs))
+            c.services.toast("Downloading ${batch.size + 1} episodes from ${l.source.ifBlank { l.name }} (${l.qualityLabel})")
+        } else c.services.toast("Downloading ${if (d.isMovie) d.name else ep.label} (${l.source.ifBlank { l.name }}, ${l.qualityLabel})")
         onClose()
     }
-    fun downloadable(l: SourceLink) = l.playable && !l.isDash && !l.isLocalFile
+    fun downloadable(l: SourceLink) = l.downloadable()
 
     Box(Modifier.fillMaxSize().background(Color.Black.copy(0.6f)).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
         Column(
@@ -154,12 +175,22 @@ fun DownloadDialog(c: AppController, vm: DetailsViewModel, d: MediaDetails, ep: 
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Download", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    Text(if (batch.isNotEmpty()) "Download ${batch.size + 1} episodes" else "Download", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
                     Text(if (d.isMovie) d.name else "${d.name} · ${ep.label}", color = Color(0xFFB0B0B8), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 if (searching) CircularProgressIndicator(Modifier.size(22.dp), color = Accent, strokeWidth = 2.dp)
-                TextButton(onClick = onClose) { Text("Close") }
+                TextButton(onClick = onClose) { Text(if (prompt != null) "Skip" else "Close") }
             }
+            if (batch.isNotEmpty()) Text(
+                "Pick the source for ${ep.label.substringBefore(" - ")}: the same source (and subtitle languages) is used for " +
+                    "${batch.first().label.substringBefore(" - ")}–${batch.last().label.substringBefore(" - ")}. " +
+                    "You are asked again for an episode that doesn't have it.",
+                color = Color(0xFFB0B0B8), fontSize = 13.sp,
+            )
+            if (prompt != null) Text(
+                "${prompt.wanted} has no link for this episode${if (links.isEmpty()) ", and no other source was found either." else ". Pick another source, or Skip."}",
+                color = Color(0xFFE0A0A0), fontSize = 13.sp,
+            )
             val ordered = settings.order(links.toList())
             // Best = the preferred quality (Settings → Player): the highest at or below it; sources above it only when
             // nothing fits. Equal qualities keep the priority order. "Auto" streams are capped when downloading.

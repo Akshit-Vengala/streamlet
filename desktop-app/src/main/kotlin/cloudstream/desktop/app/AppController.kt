@@ -25,6 +25,14 @@ class AppController(val services: AppServices) {
     val library = LibraryViewModel({ services.library })
     private val detailsCache = HashMap<String, DetailsViewModel>()
 
+    /** "Download season": one source choice applied to every aired episode of a season. */
+    val seasonDownloads by lazy {
+        SeasonDownloads(
+            services.scope, services.downloads, { providerByName(it) },
+            { services.settings.defaultQuality.value }, { services.settings.order(it) }, { services.toast(it) },
+        )
+    }
+
     /** App self-updater (GitHub Releases of the repo set at build time; off when none). */
     val updater = cloudstream.desktop.app.update.AppUpdater(services.scope)
 

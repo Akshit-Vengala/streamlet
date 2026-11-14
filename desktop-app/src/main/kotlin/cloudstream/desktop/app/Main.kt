@@ -95,6 +95,8 @@ fun main(argv: Array<String>) {
     if ("--real-play-shot" in argv)exitProcess(RealPlayShot.run(argv))
     if ("--play-flow-shot" in argv) exitProcess(PlayFlowShot.run(java.io.File(argv[argv.indexOf("--play-flow-shot") + 1])))
     argv.indexOf("--sync-probe").takeIf { it >= 0 }?.let { exitProcess(cloudstream.desktop.app.sync.SyncProbe.run(File(argv.getOrElse(it + 1) { "sync-probe" }))) }
+    // `--relay-probe [wss://broker/mqtt ...]`: public MQTT brokers as watch party relays (latency, loss, live party).
+    if ("--relay-probe" in argv) exitProcess(cloudstream.desktop.app.party.RelayProbe.run(argv))
     if (args.screenshots != null) exitProcess(Screenshots.run(args.screenshots))
 
     // The window opens at once with a splash; the services (storage, extension loader, ...) are built on a background

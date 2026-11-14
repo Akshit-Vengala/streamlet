@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.drop
 import java.awt.Desktop
 import java.io.File
 import kotlinx.coroutines.launch
@@ -75,6 +76,8 @@ class AppServices(
     val downloads: Downloads by lazy {
         Downloads(File(rootDir, "data/downloads.json"), scope) { globalSettings.downloadFolder() }.also { d ->
             scope.launch { globalSettings.maxDownloads.collect { d.maxParallel = it } }
+            // A new download folder: unfinished downloads move there (new ones always go to the current folder).
+            scope.launch { globalSettings.downloadDir.drop(1).collect { d.relocate() } }
         }
     }
 

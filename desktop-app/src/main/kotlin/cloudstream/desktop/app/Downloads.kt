@@ -11,6 +11,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -147,7 +149,20 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
         _items.value.filter { it.status == DownloadItem.Status.Queued }.take((maxParallel - running).coerceAtLeast(0)).forEach { item ->
             set(item.id) { it.copy(status = DownloadItem.Status.Downloading, error = null) }
             jobs[item.id] = scope.launch {
-                val r = runCatching { run(item.id) }
+                // Network errors (the connection dropping for a minute, a CDN timing out) are retried with growing
+                // waits; each attempt resumes from what is on disk. Anything else (HTTP 4xx, a web page) fails at once.
+                var attempt = 0
+                var r: Result<Unit>
+                while (true) {
+                    r = runCatching { run(item.id) }
+                    val e = r.exceptionOrNull() ?: break
+                    if (e is CancellationException || e !is java.io.IOException || attempt >= RETRY_WAITS_S.size) break
+                    val wait = RETRY_WAITS_S[attempt++]
+                    log.info("Download of ${item.titleName} ${item.episodeLabel}: $e; retry $attempt/${RETRY_WAITS_S.size} in ${wait}s")
+                    set(item.id) { it.copy(error = "Connection lost, retrying in ${wait}s") }
+                    runCatching { kotlinx.coroutines.delay(wait * 1000L) }.onFailure { r = Result.failure(it); break }
+                    set(item.id) { it.copy(error = null) }
+                }
                 jobs.remove(item.id)
                 r.exceptionOrNull()?.let { e ->
                     if (e is CancellationException) return@launch
@@ -165,7 +180,7 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
         fetchSubtitles(id)
         if (item.isM3u8) hls(id) else direct(id)
         set(id) { it.copy(status = DownloadItem.Status.Done, bytes = File(it.file).length(), total = File(it.file).length()) }
-        log.info("Downloaded ${item.titleName} ${item.episodeLabel}: ${File(item.file).length() / 1_048_576} MB")
+        log.info("Downloaded ${item.titleName} ${item.episodeLabel}: ${File(byId(id)?.file ?: item.file).length() / 1_048_576} MB")
     }
 
     private fun headersOf(item: DownloadItem): Map<String, String> {
@@ -199,7 +214,10 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
         set(id) { it.copy(pendingSubs = emptyList(), subtitles = saved) }
     }
 
-    /** HLS: segments in order (a few fetched ahead), appended to the .ts file; resumes after the last whole segment. */
+    /**
+     * HLS: segments in order (a few fetched ahead), appended to the file (.ts, or .mp4 with the init segment first for
+     * an fMP4 stream); resumes after the last whole segment.
+     */
     private suspend fun hls(id: String) = kotlinx.coroutines.coroutineScope {
         val item = byId(id) ?: return@coroutineScope
         val (playlist, height) = pickVariant(item)
@@ -210,10 +228,20 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
         )
         val total = data.size
         check(total > 0) { "The playlist has no segments" }
-        val start = byId(id)!!.segmentsDone.coerceIn(0, total)
-        RandomAccessFile(item.file, "rw").use { out ->
+        // fMP4 (CMAF) streams: segments are MP4 fragments, unplayable without the init segment (#EXT-X-MAP, the
+        // ftyp+moov header). It goes first and the file is an .mp4, not a .ts.
+        val init = initSegment(item, playlist)
+        var start = byId(id)!!.segmentsDone.coerceIn(0, total)
+        if (init != null && item.file.endsWith(".ts", true)) {
+            File(item.file).delete() // a partial .ts from before this fix lacks the header: start over
+            start = 0
+            set(id) { it.copy(file = item.file.dropLast(3) + ".mp4", segmentsDone = 0, bytes = 0) }
+        }
+        val file = byId(id)!!.file
+        RandomAccessFile(file, "rw").use { out ->
             out.setLength(if (start == 0) 0 else byId(id)!!.bytes.coerceAtMost(out.length()))
             out.seek(out.length())
+            if (start == 0 && init != null) out.write(init)
             set(id) { it.copy(segmentsTotal = total) }
             val ahead = ArrayDeque<Deferred<ByteArray?>>()
             var next = start
@@ -222,7 +250,8 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
             var done = start
             var lastSave = 0L
             while (ahead.isNotEmpty() && isActive) {
-                val bytes = ahead.removeFirst().await() ?: error("Segment ${done + 1} of $total could not be downloaded")
+                // An IOException, so the download is retried (from this segment) rather than failed outright.
+                val bytes = ahead.removeFirst().await() ?: throw java.io.IOException("Segment ${done + 1} of $total could not be downloaded")
                 out.write(stripFakeHeader(bytes))
                 done++
                 fill()
@@ -230,6 +259,55 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
                 val len = out.length()
                 _items.update { l -> l.map { if (it.id == id) it.copy(segmentsDone = done, bytes = len) else it } }
                 if (now - lastSave > 2000) { save(); lastSave = now }
+            }
+        }
+        if (init != null && isActive) toPlainMp4(File(file))
+    }
+
+    /**
+     * The stitched fMP4 seeks badly (VLC shows blocks for seconds after a seek): rewrite it as a plain MP4 with one
+     * index, in place. On failure the fragmented file stays (it plays, only seeking is worse).
+     */
+    private fun toPlainMp4(f: File) {
+        val tmp = File(f.path + ".part")
+        runCatching {
+            Mp4Defrag.defrag(f, tmp)
+            java.nio.file.Files.move(tmp.toPath(), f.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        }.onFailure { tmp.delete(); log.warning("${f.name}: not rewritten as a plain MP4: $it") }
+    }
+
+    private val relocating = kotlinx.coroutines.sync.Mutex()
+
+    /**
+     * The download folder changed: move the unfinished downloads (and their subtitles) there, pausing any that are
+     * running while their file moves and starting them again after. Finished downloads stay where they are.
+     */
+    fun relocate() {
+        scope.launch {
+            relocating.withLock {
+                val dir = folder()
+                for (item in _items.value.filter { it.status != DownloadItem.Status.Done }) {
+                    val target = File(File(dir, safe(item.titleName)), File(item.file).name)
+                    if (target.absoluteFile == File(item.file).absoluteFile) continue
+                    val wasActive = item.active
+                    set(item.id) { it.copy(status = DownloadItem.Status.Paused) } // pump() leaves it alone meanwhile
+                    jobs.remove(item.id)?.cancelAndJoin()
+                    val moved = runCatching {
+                        target.parentFile.mkdirs()
+                        fun move(from: File, to: File) { if (from.isFile) java.nio.file.Files.move(from.toPath(), to.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING) }
+                        move(File(item.file), target)
+                        val subs = item.subtitles.orEmpty().map { s -> File(target.parentFile, File(s.path).name).also { move(File(s.path), it) }.let { s.copy(path = it.absolutePath) } }
+                        File(item.file).parentFile?.takeIf { d -> d.isDirectory && d.list().isNullOrEmpty() }?.delete()
+                        subs
+                    }
+                    moved.onSuccess { log.info("Moved ${item.titleName} ${item.episodeLabel} to ${target.parent}") }
+                        .onFailure { log.warning("${item.titleName} ${item.episodeLabel} not moved to $dir: $it") }
+                    set(item.id) {
+                        val base = if (moved.isSuccess) it.copy(file = target.absolutePath, subtitles = moved.getOrNull()) else it
+                        base.copy(status = if (wasActive) DownloadItem.Status.Queued else item.status)
+                    }
+                }
+                pump()
             }
         }
     }
@@ -247,6 +325,19 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
         val best = pickBest(variants.sortedByDescending { it.bandwidth }, item.maxQuality) { v -> v.height.takeIf { it > 0 } ?: 400 }!!
         log.info("${item.titleName} ${item.episodeLabel}: ${best.height}p of ${variants.map { it.height }.distinct()} (preferred ${item.maxQuality.takeIf { it > 0 }?.let { "${it}p" } ?: "best"})")
         return best.url to best.height
+    }
+
+    /** The init segment named by the media playlist's #EXT-X-MAP, or null when there is none (plain MPEG-TS). */
+    private fun initSegment(item: DownloadItem, playlist: String): ByteArray? {
+        val res = http.send(request(playlist, headersOf(item)), HttpResponse.BodyHandlers.ofString())
+        check(res.statusCode() in 200..299) { "Playlist: HTTP ${res.statusCode()}" }
+        val map = res.body().lines().map { it.trim() }.firstOrNull { it.startsWith("#EXT-X-MAP:") } ?: return null
+        val uri = Regex("""URI="([^"]+)"""").find(map)?.groupValues?.get(1) ?: return null
+        val url = URI(res.uri().toString()).resolve(uri).toString()
+        val r = http.send(request(url, headersOf(item)), HttpResponse.BodyHandlers.ofByteArray())
+        if (r.statusCode() !in 200..299) throw java.io.IOException("Init segment: HTTP ${r.statusCode()}")
+        log.info("${item.titleName} ${item.episodeLabel}: fMP4 stream, init segment ${r.body().size} bytes")
+        return r.body()
     }
 
     /** A direct file: Range request from what is already on disk. */
@@ -309,6 +400,9 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
 
     companion object {
         const val PARALLEL_SEGMENTS = 4
+        private val MP4_BOXES = setOf("ftyp", "styp", "sidx", "moof", "mdat", "emsg", "prft", "free")
+        /** Waits before each automatic retry after a network error: about 4 minutes in all before it is marked failed. */
+        private val RETRY_WAITS_S = longArrayOf(5, 10, 20, 40, 60, 60, 60)
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 
         data class Variant(val url: String, val height: Int, val bandwidth: Long)
@@ -360,6 +454,8 @@ class Downloads(private val indexFile: File, private val scope: CoroutineScope, 
          */
         fun stripFakeHeader(b: ByteArray): ByteArray {
             if (b.isEmpty() || b[0] == 0x47.toByte()) return b
+            // An MP4 fragment (fMP4/CMAF stream): no TS inside; searching it could cut real data at a chance match.
+            if (b.size >= 8 && String(b, 4, 4, Charsets.ISO_8859_1) in MP4_BOXES) return b
             val limit = minOf(b.size - 377, 4096)
             for (i in 0 until limit.coerceAtLeast(0)) {
                 if (b[i] == 0x47.toByte() && b[i + 188] == 0x47.toByte() && b[i + 376] == 0x47.toByte()) return b.copyOfRange(i, b.size)

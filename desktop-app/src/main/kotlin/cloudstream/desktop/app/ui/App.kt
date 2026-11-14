@@ -142,6 +142,13 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
                         is Screen.Player -> PlayerScreen(c, s.request)
                     }
                     if (current !is Screen.Player) TopBar(c, stack.first())
+                    // A season download's episode without the chosen source: pick another (shown over any screen but the player).
+                    val prompts by c.seasonDownloads.prompts.collectAsStateCompat()
+                    prompts.firstOrNull()?.takeIf { current !is Screen.Player }?.let { p ->
+                        androidx.compose.runtime.key(p.id) {
+                            DownloadDialog(c, p.card, p.details, p.episode, prompt = p) { c.seasonDownloads.dismiss(p) }
+                        }
+                    }
                     Column(Modifier.align(Alignment.BottomCenter).padding(16.dp)) { SnackbarHost(snack) }
                 }
             }

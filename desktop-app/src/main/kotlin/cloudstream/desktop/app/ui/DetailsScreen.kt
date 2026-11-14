@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -65,6 +67,9 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
     androidx.compose.runtime.LaunchedEffect(vm) { vm.refreshProgress() }
     val downloads by c.services.downloads.items.collectAsStateCompat()
     var downloadFor by remember { mutableStateOf<EpisodeItem?>(null) }
+    // "Download season": the first episode (its dialog picks the source) and the rest that follow it.
+    var seasonBatch by remember { mutableStateOf<List<EpisodeItem>?>(null) }
+    val looking by c.seasonDownloads.looking.collectAsStateCompat()
 
     Box(Modifier.fillMaxSize()) {
         when (val l = s.load) {
@@ -95,6 +100,19 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
                         item {
                             Row(Modifier.padding(start = 48.dp, end = 48.dp, top = 20.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Text("Episodes", style = MaterialTheme.typography.headlineSmall, color = Color.White, modifier = Modifier.weight(1f))
+                                if (!d.isMovie) {
+                                    val todo = cloudstream.desktop.app.SeasonDownloads.eligible(episodes) { ep ->
+                                        episodeId(vm.card.provider, ep.data).let { id -> downloads.firstOrNull { it.id == id } }
+                                    }.filter { episodeId(vm.card.provider, it.data) !in looking }
+                                    if (todo.isNotEmpty()) TextButton(onClick = { seasonBatch = todo }) {
+                                        Text(
+                                            "⤓  Download ${if (todo.size == 1) "1 episode" else "${todo.size} episodes"}" +
+                                                if (todo.size == cloudstream.desktop.app.SeasonDownloads.MAX_EPISODES) " (next ${todo.size})" else "",
+                                            color = Color.White, fontWeight = FontWeight.SemiBold,
+                                        )
+                                    }
+                                    Spacer(Modifier.width(12.dp))
+                                }
                                 Text("${episodes.size} episode(s)", color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
@@ -113,7 +131,7 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
                                 ?: if (watched) 1f else null
                             val dlId = episodeId(vm.card.provider, ep.data)
                             val dl = downloads.firstOrNull { it.id == dlId }
-                            EpisodeRow(i + 1, ep, d.posterUrl, frac, watched, dl, onPlay = { c.playEpisode(vm, ep) }, onDownload = {
+                            EpisodeRow(i + 1, ep, d.posterUrl, frac, watched, dl, busy = dl == null && dlId in looking, onPlay ={ c.playEpisode(vm, ep) }, onDownload = {
                                 when (dl?.status) {
                                     null, cloudstream.desktop.app.DownloadItem.Status.Failed -> downloadFor = ep
                                     cloudstream.desktop.app.DownloadItem.Status.Paused -> c.services.downloads.resume(dl.id)
@@ -155,6 +173,7 @@ fun DetailsScreen(c: AppController, vm: DetailsViewModel) {
         }
         val loaded = (s.load as? DetailsLoad.Loaded)?.details
         downloadFor?.let { ep -> if (loaded != null) DownloadDialog(c, vm, loaded, ep) { downloadFor = null } }
+        seasonBatch?.let { eps -> if (loaded != null) DownloadDialog(c, vm.card, loaded, eps.first(), batch = eps.drop(1)) { seasonBatch = null } }
     }
 }
 
@@ -243,7 +262,7 @@ private fun PillChip(label: String, selected: Boolean, onClick: () -> Unit) {
 @Composable
 private fun EpisodeRow(
     n: Int, ep: EpisodeItem, fallbackThumb: String?, progress: Float?, watched: Boolean,
-    download: cloudstream.desktop.app.DownloadItem?,
+    download: cloudstream.desktop.app.DownloadItem?, busy: Boolean,
     onPlay: () -> Unit, onDownload: () -> Unit, menu: () -> List<CardMenuItem>,
 ) {
     val src = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
@@ -282,7 +301,9 @@ private fun EpisodeRow(
             withoutUpcoming(ep.description)?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2) }
             // Watch progress is the bar on the thumbnail (no "Resume at" text).
         }
-        DownloadButton(download, onDownload)
+        if (busy) Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) { // finding its source for a season download
+            androidx.compose.material3.CircularProgressIndicator(Modifier.size(28.dp), color = Color.White.copy(0.6f), strokeWidth = 2.dp)
+        } else DownloadButton(download, onDownload)
     }
     menuAt?.let { at -> CardMenu(true, at, menuItems) { menuAt = null } }
     }
