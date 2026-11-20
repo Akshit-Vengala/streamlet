@@ -84,6 +84,26 @@ private class PlayerSession(
     @Volatile var generation = 0
     private val mpv get() = h.player as? cloudstream.desktop.player.LibMpvPlayer
     private val dp get() = h.player as? cloudstream.desktop.player.DesktopPlayer
+    private val party get() = c.party
+    /** In a watch party, and not its host: the room decides what plays (no own skipping, no own next episode). */
+    private val partyGuest get() = party.isActive && party.isGuest
+
+    /** This screen as the watch party sees it (built-in libmpv player only). */
+    val partyTarget: cloudstream.desktop.app.party.PartyTarget? = (h.player as? cloudstream.desktop.player.LibMpvPlayer)?.let { m ->
+        object : cloudstream.desktop.app.party.PartyTarget {
+            override val intended get() = cloudstream.desktop.app.party.PartyManager.mediaRef(
+                req.card, req.titleName, req.episode, current?.let { it.name.ifBlank { it.source } })
+            override fun loaded() = current != null && lastState.durationMs > 0
+            override fun positionMs() = m.property("time-pos")?.toDoubleOrNull()?.let { (it * 1000).toLong() } ?: lastState.positionMs
+            override fun isPlaying() = m.property("pause") == "no"
+            override fun isBuffering() = lastState.buffering || m.property("seeking") == "yes"
+            override fun aheadMs(): Long? = if (isBuffering()) 0 else m.property("demuxer-cache-duration")?.toDoubleOrNull()?.let { (it * 1000).toLong() }
+            override fun play() = m.play()
+            override fun pause() = m.pause()
+            override fun seek(ms: Long) = m.seek(ms)
+            override fun setSpeed(speed: Double) { m.setSpeed(speed); ui.speed = speed }
+        }
+    }
 
     private fun links() = dm.state.value.links.takeIf { it.episode?.data == req.episode.data }
     fun alternatives(): List<SourceLink> = links()?.links.orEmpty().let { l ->
@@ -94,7 +114,10 @@ private class PlayerSession(
     /** Loading screen over: play the best source by priority (lookup finished, or "Skip loading"). */
     fun startBest(): Boolean {
         if (current != null) return true
-        val best = alternatives().firstOrNull { it.playable && it.url !in failed } ?: return false
+        // Watch party: the host's source first (same name), if this machine found it too.
+        val roomSource = party.preferredSource(req.card.provider, req.card.url, req.episode.data)
+        val best = alternatives().firstOrNull { it.playable && it.url !in failed && roomSource != null && it.name.ifBlank { it.source } == roomSource }
+            ?: alternatives().firstOrNull { it.playable && it.url !in failed } ?: return false
         open(best, req.startMs)
         return true
     }
@@ -175,23 +198,38 @@ private class PlayerSession(
         ui.episodeLine = req.episode.label.takeIf { it != "Play" && it != req.titleName && it != "Movie" }.orEmpty()
         ui.hasNext = next != null
         ui.onBack = { c.back() }
-        ui.onNext = { if (next != null) { ui.autoNextIn = null; c.back(); c.playEpisode(dm, next) } }
-        ui.onSkip = { ui.skip?.let { seg -> skipped += seg.kind; ui.skip = null; h.player.seek(seg.endMs) } }
+        ui.onNext = {
+            if (next != null) {
+                ui.autoNextIn = null
+                // A guest asks the room; the host's answer brings everyone (this screen too) to the next episode.
+                if (partyGuest) party.requestEpisode(dm, next) else { c.back(); c.playEpisode(dm, next) }
+            }
+        }
+        ui.onSkip = { ui.skip?.let { seg -> skipped += seg.kind; ui.skip = null; if (party.isActive) party.seek(seg.endMs) else h.player.seek(seg.endMs) } }
         ui.onCancelAutoNext = { autoNextCancelled = true; ui.autoNextIn = null }
         val prev = dm.visibleEpisodes().let { l -> l.indexOfFirst { it.data == req.episode.data }.takeIf { it > 0 }?.let { l[it - 1] } }
         ui.hasPrev = prev != null
-        ui.onPrev = { if (prev != null) { c.back(); c.playEpisode(dm, prev) } }
+        ui.onPrev = { if (prev != null) { if (partyGuest) party.requestEpisode(dm, prev) else { c.back(); c.playEpisode(dm, prev) } } }
         ui.onFullscreen = { c.fullscreen.value = !c.fullscreen.value }
         // mpv's own pause flag ("playing" reads false while buffering, so it must not decide).
         // mpv's own pause flag ("playing" reads false while buffering, so it must not decide).
-        ui.onPlayPause = { mpv?.togglePause() ?: run { if (h.player.state.value.playing) h.player.pause() else h.player.play() } }
-        ui.onSeek = { h.player.seek(it.coerceAtLeast(0)) }
-        ui.onSeekBy = { d -> mpv?.seekBy(d) ?: h.player.seek((h.player.state.value.positionMs + d).coerceAtLeast(0)) }
+        // In a watch party every play / pause / seek goes through the room (the host applies it for everyone).
+        ui.onPlayPause = {
+            if (party.isActive && partyTarget != null) party.togglePlay()
+            else mpv?.togglePause() ?: run { if (h.player.state.value.playing) h.player.pause() else h.player.play() }
+        }
+        ui.onSeek = { if (party.isActive && partyTarget != null) party.seek(it) else h.player.seek(it.coerceAtLeast(0)) }
+        ui.onSeekBy = { d ->
+            if (party.isActive && partyTarget != null) party.seekBy(d)
+            else mpv?.seekBy(d) ?: h.player.seek((h.player.state.value.positionMs + d).coerceAtLeast(0))
+        }
         // The speed the user sets is kept (next episode, restarts); hold-for-2x is temporary and never saved.
-        ui.onSpeed = { ui.speed = it; dp?.setSpeed(it); settings.setPlaybackSpeed(it) }
-        ui.onHoldSpeed = { s -> dp?.setSpeed(s ?: ui.speed) }
-        ui.speed = settings.playbackSpeed.value
+        // In a watch party speed is shared (always 1x for now).
+        ui.onSpeed = { if (party.isActive) c.services.toast("Speed is shared in a watch party") else { ui.speed = it; dp?.setSpeed(it); settings.setPlaybackSpeed(it) } }
+        ui.onHoldSpeed = { s -> if (!party.isActive) dp?.setSpeed(s ?: ui.speed) }
+        ui.speed = if (party.isActive) 1.0 else settings.playbackSpeed.value
         if (ui.speed != 1.0) dp?.setSpeed(ui.speed)
+        ui.onParty = { ui.extraDialog = { PartyDialog(c, onDismiss = { ui.extraDialog = null }) } }
         ui.onQuit = { c.services.close(); kotlin.system.exitProcess(0) }
         ui.onStop = { c.back() }
         ui.onScreenshot = {
@@ -292,8 +330,10 @@ private class PlayerSession(
     private fun updatePrompts(st: PlayerState) {
         val hasNext = ui.hasNext
         val seg = segments.firstOrNull { st.positionMs in it && it.kind !in skipped }
-        if (seg != null && seg.kind != cloudstream.desktop.app.SkipSegment.Kind.Credits && settings.autoSkipIntro.value && st.playing) {
-            skipped += seg.kind; h.player.seek(seg.endMs); c.services.toast("Skipped ${seg.kind.name.lowercase()}")
+        if (seg != null && seg.kind != cloudstream.desktop.app.SkipSegment.Kind.Credits && settings.autoSkipIntro.value && st.playing && !partyGuest) {
+            skipped += seg.kind
+            if (party.isActive) party.seek(seg.endMs) else h.player.seek(seg.endMs)
+            c.services.toast("Skipped ${seg.kind.name.lowercase()}")
             ui.skip = null
         } else {
             // In the credits with an episode after this one, "Next episode" replaces "Skip credits".
@@ -310,7 +350,7 @@ private class PlayerSession(
         while (true) {
             delay(500)
             val st = lastState
-            if (!st.ended || !ui.hasNext || !settings.autoNextEpisode.value || autoNextCancelled || ui.autoNextIn != null) continue
+            if (!st.ended || !ui.hasNext || !settings.autoNextEpisode.value || autoNextCancelled || ui.autoNextIn != null || partyGuest) continue
             for (s in 5 downTo 1) {
                 ui.autoNextIn = s
                 delay(1000)
@@ -323,6 +363,8 @@ private class PlayerSession(
     /** All long-running work of the session; cancelled when the player screen goes away. */
     suspend fun run() = coroutineScope {
         PlayerDebug.player = mpv
+        partyTarget?.let { party.register(it) }
+            ?: run { if (party.isActive) c.services.toast("Watch party needs the built-in player (Settings > Player)") }
         // Player state -> overlay (no recomposition of the main window involved).
         launch {
             var synced = false
@@ -478,6 +520,7 @@ fun PlayerScreen(c: AppController, req: PlayRequest) {
         onDispose {
             session?.let { if (it.lastState.positionMs > 0) saveResume(c, req, it.lastState) }
             if (PlayerDebug.player === h?.player) PlayerDebug.player = null
+            session?.partyTarget?.let { c.party.unregister(it) } // the party never touches a released player
             h?.release()
             c.fullscreen.value = false
         }

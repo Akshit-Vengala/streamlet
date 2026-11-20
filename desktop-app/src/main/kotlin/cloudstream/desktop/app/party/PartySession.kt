@@ -1,5 +1,6 @@
 package cloudstream.desktop.app.party
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -12,6 +13,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.math.abs
 
 /** The local player as the party sees it (adapter over DesktopPlayer + the source resolver). */
@@ -25,6 +29,8 @@ interface PartyPlayer {
     fun pause()
     fun seek(ms: Long)
     fun setSpeed(speed: Double)
+    /** The current playback speed (restored when leaving: speed is room state while in a party). */
+    fun speed(): Double
     fun currentMedia(): MediaRef?
     /** Resolve [media] with the local provider and open it paused at 0. false = not installed / no working source. */
     suspend fun open(media: MediaRef): Boolean
@@ -48,6 +54,14 @@ data class PartyConfig(
     val hostTimeoutMs: Long = 60_000,
     val pingEveryMs: Long = 30_000,
     val maxRequestsPerSecond: Int = 5,
+    /** Host: after it moves its own player (play, seek, open, scheduled start), how long before its drift is judged. */
+    val settleMs: Long = 2000,
+    /** Host: its player this far off the room timeline (a short stall) moves the timeline to the player... */
+    val reanchorAboveMs: Long = 300,
+    /** ...at most this often. */
+    val reanchorGapMs: Long = 5000,
+    /** Guest: after an own play/pause/seek, how long to wait for the host's answer before snapping back to the room. */
+    val optimisticHoldMs: Long = 2000,
 )
 
 data class MemberStatus(
@@ -99,9 +113,11 @@ class PartySession(
     private val scope: CoroutineScope,
     private val selfName: String,
     val selfId: String = PartyKey.newMemberId(),
-    private val now: () -> Long = System::currentTimeMillis,
+    /** A MONOTONIC local clock (ms): the wall clock jumps when the OS or NTP adjusts it. Only differences matter. */
+    private val now: () -> Long = { System.nanoTime() / 1_000_000 },
     private val config: PartyConfig = PartyConfig(),
     private val appVersion: String = "",
+    private val log: (String) -> Unit = {},
 ) {
     private val _ui = MutableStateFlow(PartyUi(selfId = selfId))
     val ui: StateFlow<PartyUi> = _ui.asStateFlow()
@@ -130,9 +146,25 @@ class PartySession(
     private var opening: MediaRef? = null
     private var speedSet: Double? = null
     private var startJob: Job? = null
+    private var openJob: Job? = null
+    private var left = false
+    private var speedBefore = 1.0
+    /** Host: do not judge its own drift before this (player still settling after a jump). */
+    private var settleUntil = 0L
+    private var lastReanchorAt = Long.MIN_VALUE / 2
+    /** Guest: own optimistic action waiting for the host's answer (a state with seq > [holdSeq]) until [holdUntil]. */
+    private var holdSeq = 0L
+    private var holdUntil = Long.MIN_VALUE / 2
+    private fun holding() = now() < holdUntil
+    private var holdPending = false
+    /** Frame counters: own (starts high so a restarted session never reuses old numbers), and a window per sender. */
+    private var sendCounter = System.currentTimeMillis() * 1000
+    private val windows = HashMap<String, ReplayWindow>()
     private fun startAt(t: Long) = if (st.members.size > 1) t + config.startLeadMs else t
 
     private fun hostNow() = if (st.isHost) now() else now() + clock.offsetMs
+    /** A guest knows where the room is only once its clock is synced to the host's (local clocks are unrelated). */
+    private fun synced() = st.isHost || clock.synced
     private fun nameOf(id: String?) = st.member(id ?: "")?.name ?: "Someone"
 
     // ---- lifecycle -------------------------------------------------------------------------------------------
@@ -143,29 +175,42 @@ class PartySession(
         welcomed = true
         _ui.update {
             it.copy(
-                connected = true, hostId = selfId, mode = mode, members = listOf(Member(selfId, selfName, t)),
+                connected = true, hostId = selfId, mode = mode, members = listOf(Member(selfId, selfName, 1)),
                 room = RoomState(seq = 1, media = player.currentMedia(), positionMs = player.positionMs(), atHostMs = t, playing = player.isPlaying()),
             )
         }
+        setSpeed(st.room.speed)
         broadcastState()
     }
 
     /** Join the room of [key]: says hello until the host answers. */
-    fun join() = start { sendHello() }
+    fun join() = start { transport.awaitReady(); sendHello() }
 
     private fun start(init: suspend () -> Unit) {
-        jobs += scope.launch { transport.incoming.collect { f -> key.open(f)?.let(PartyCodec::decode)?.let { handle(it) } } }
+        jobs += scope.launch { transport.incoming.collect { f -> guarded("message") { receive(f) } } }
         jobs += scope.launch {
-            init()
-            while (isActive) { delay(config.tickMs); tick() }
+            speedBefore = player.speed()
+            guarded("start") { init() }
+            while (isActive) { delay(config.tickMs); guarded("tick") { tick() } }
         }
     }
 
-    suspend fun leave() {
-        runCatching { send(Bye(selfId)) }
+    /** Everything the session launches goes through [guarded]: a player that throws must not end the session. */
+    private fun launchSafe(block: suspend () -> Unit) = scope.launch { guarded("task") { block() } }
+
+    /** One bad message or player hiccup must never stop the session. */
+    private suspend fun guarded(what: String, block: suspend () -> Unit) {
+        try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) { log("party: $what failed: $e") }
+    }
+
+    suspend fun leave() = withContext(scope.coroutineContext[ContinuationInterceptor] ?: EmptyCoroutineContext) {
+        if (left) return@withContext
+        left = true
+        startJob?.cancel(); openJob?.cancel()
         jobs.forEach { it.cancel() }
-        runCatching { transport.close() }
-        player.setSpeed(st.room.speed)
+        try { send(Bye(selfId)) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+        try { transport.close() } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+        player.setSpeed(speedBefore)
         _ui.update { it.copy(connected = false) }
     }
 
@@ -176,16 +221,20 @@ class PartySession(
     fun seek(ms: Long) = act(Action.Seek, ms.coerceAtLeast(0))
     fun changeEpisode(media: MediaRef) = act(Action.Episode, 0, media)
 
-    private fun act(a: Action, pos: Long? = null, media: MediaRef? = null) = scope.launch {
+    private fun act(a: Action, pos: Long? = null, media: MediaRef? = null) = launchSafe {
+        if (left) return@launchSafe
         when {
             st.isHost -> applyAction(a, pos, media, selfId)
             st.canControl(selfId) -> {
                 // Feels instant; the host's next state confirms (or corrects) it.
-                if (!st.detached) when (a) {
-                    Action.Play -> player.play()
-                    Action.Pause -> player.pause()
-                    Action.Seek -> { player.seek(pos ?: 0); drift.reset() }
-                    Action.Episode -> {}
+                if (!st.detached && a != Action.Episode) {
+                    when (a) {
+                        Action.Play -> player.play()
+                        Action.Pause -> player.pause()
+                        else -> { player.seek(pos ?: 0); drift.reset() }
+                    }
+                    // Until the host answers, heartbeats and drift correction must not undo it.
+                    holdSeq = st.room.seq; holdUntil = now() + config.optimisticHoldMs; holdPending = true
                 }
                 send(Request(selfId, a, pos, media, st.room.seq))
             }
@@ -197,29 +246,29 @@ class PartySession(
     }
 
     /** Pause just for me (leave the shared timeline until [rejoin]); the room does not wait for detached members. */
-    fun detach() = scope.launch {
+    fun detach() = launchSafe {
         _ui.update { it.copy(detached = true) }
         player.pause(); forceStatus = true
     }
 
-    fun rejoin() = scope.launch {
+    fun rejoin() = launchSafe {
         _ui.update { it.copy(detached = false, slow = false) }
         drift.reset(); forceStatus = true
         applyRoom(st.room, explicit = true)
     }
 
     /** Give up on being "slow": jump to the room's position and chase it again. */
-    fun catchUp() = scope.launch {
+    fun catchUp() = launchSafe {
         drift.reset(); _ui.update { it.copy(slow = false) }
         applyRoom(st.room, explicit = true)
     }
 
-    fun chat(text: String) = scope.launch {
-        val t = text.trim().take(500).ifEmpty { return@launch }
+    fun chat(text: String) = launchSafe {
+        val t = text.trim().take(500).ifEmpty { return@launchSafe }
         send(Chat(selfId, t)); _events.emit(PartyEvent.ChatLine(selfName, t, self = true))
     }
 
-    fun react(emoji: String) = scope.launch {
+    fun react(emoji: String) = launchSafe {
         send(React(selfId, emoji.take(8))); _events.emit(PartyEvent.Reaction(selfName, emoji.take(8)))
     }
 
@@ -234,24 +283,39 @@ class PartySession(
         clock.reset(); pingsSent = 0; lastSeen[id] = now()
     }
 
-    private fun hostOnly(block: () -> Unit) = scope.launch {
-        if (!st.isHost) return@launch
+    private fun hostOnly(block: () -> Unit) = launchSafe {
+        if (!st.isHost) return@launchSafe
         block()
         send(Roster(selfId, st.members, st.hostId, st.mode))
     }
 
     // ---- incoming --------------------------------------------------------------------------------------------
 
+    private suspend fun receive(f: ByteArray) {
+        val frame = key.open(f)?.let(PartyCodec::decodeFrame) ?: return
+        val m = frame.msg
+        if (m.from == selfId) return
+        // Replay protection: brokers are untrusted and anyone can re-send captured ciphertext. Each sender numbers
+        // its frames; a number seen before, or too old for the window, is dropped. No exceptions (not even Hello: a
+        // replayed Hello must not reset a member's window). A restarted session has a new random id, hence a new
+        // window, and its counter starts from the wall clock, so even a reused id would continue upwards.
+        if (!windows.getOrPut(m.from) { ReplayWindow() }.accept(frame.n)) return
+        handle(m)
+    }
+
     private suspend fun handle(m: PartyMsg) {
-        if (m.from == selfId || (m.to != null && m.to != selfId)) return
+        if (m.to != null && m.to != selfId) return
+        val member = st.member(m.from) != null
+        // Only members talk in the room (a non-member can only say Hello, or be the host welcoming us).
+        if (!member && (m is Request || m is Status || m is Chat || m is React) && (st.isHost || welcomed)) return
         lastSeen[m.from] = now()
         when (m) {
             is Hello -> if (st.isHost) onHello(m)
             is Welcome -> onWelcome(m)
-            is Roster -> onRoster(m)
+            is Roster -> if (welcomed) onRoster(m) // before the Welcome, a heartbeat roster says nothing about us
             is StateMsg -> if (m.from == st.hostId && !st.isHost) onState(m)
             is Ping -> if (st.isHost) send(Pong(selfId, m.from, m.id, m.t0, now()))
-            is Pong -> if (m.from == st.hostId) clock.add(m.t0, m.hostT, now())
+            is Pong -> if (m.from == st.hostId && !st.isHost) onPong(m)
             is Request -> if (st.isHost) onRequest(m)
             is Status -> recordStatus(m.from, m.buffering, m.aheadMs, m.detached, m.noSource)
             is Chat -> _events.emit(PartyEvent.ChatLine(nameOf(m.from), m.text.take(500), self = false))
@@ -260,9 +324,17 @@ class PartySession(
         }
     }
 
+    private fun onPong(m: Pong) {
+        val first = !clock.synced
+        clock.add(m.t0, m.hostT, now())
+        // Until now the guest could not tell where the room is (unrelated clocks): apply it on the first sample.
+        if (first && clock.synced && welcomed) applyRoom(st.room, explicit = true)
+    }
+
     private suspend fun onHello(m: Hello) {
         if (st.member(m.from) == null) {
-            _ui.update { it.copy(members = it.members + Member(m.from, m.name.take(40), now())) }
+            val order = (st.members.maxOfOrNull { it.joinedAt } ?: 0) + 1
+            _ui.update { it.copy(members = it.members + Member(m.from, m.name.take(40), order)) }
             _events.emit(PartyEvent.Toast("${m.name.take(40)} joined"))
         }
         send(Welcome(selfId, m.from, st.members, st.hostId, st.mode, st.room))
@@ -301,6 +373,7 @@ class PartySession(
         val s = m.room
         if (s.seq < st.room.seq) return
         val explicit = s.seq > st.room.seq
+        if (s.seq > holdSeq) { holdUntil = Long.MIN_VALUE / 2; holdPending = false } // the host has answered (or moved on)
         _ui.update { it.copy(room = s) }
         if (s.waiting) forceStatus = true
         if (explicit && m.by != null && m.by != selfId && m.action != null) _events.emit(PartyEvent.Toast(describe(m.by, m.action, s)))
@@ -363,6 +436,22 @@ class PartySession(
         val gone = st.members.filter { it.id != selfId && t - (lastSeen[it.id] ?: t) > config.memberTimeoutMs }.map { it.id }
         if (gone.isNotEmpty()) removeMembers(gone, left = false)
         if (config.waitForEveryone) barrier(t)
+        reanchor(t)
+    }
+
+    /**
+     * The room timeline is the host's clock, but the host's VIDEO can fall behind it (a stall too short to pause the
+     * room, or any stall with waiting off). Guests follow the timeline, so move the timeline to the host's player.
+     */
+    private suspend fun reanchor(t: Long) {
+        val r = st.room
+        if (!r.playing || r.waiting || r.startsLaterThan(t) || st.detached || opening != null) return
+        if (r.media?.sameAs(player.currentMedia()) == false) return
+        if (!player.isPlaying() || player.isBuffering() || t < settleUntil || t - lastReanchorAt < config.reanchorGapMs) return
+        val local = player.positionMs()
+        if (abs(r.positionAt(t) - local) < config.reanchorAboveMs) return
+        lastReanchorAt = t
+        setRoom(r.copy(positionMs = local, atHostMs = t))
     }
 
     /** Pause the room while someone (not detached, able to play) buffers; resume when all are ready or after the cap. */
@@ -415,7 +504,9 @@ class PartySession(
     private suspend fun becomeHost(members: List<Member>) {
         val t = now()
         val r = st.room
-        val pos = r.positionAt(t + clock.offsetMs)
+        // Never synced to the old host: its timestamps mean nothing here, the own player is the best estimate.
+        val pos = if (clock.synced) r.positionAt(t + clock.offsetMs)
+            else if (r.media?.sameAs(player.currentMedia()) != false) player.positionMs() else r.positionMs
         _ui.update { it.copy(hostId = selfId, members = members, room = r.copy(seq = r.seq + 1, positionMs = pos, atHostMs = t), slow = false, behindMs = 0) }
         members.forEach { lastSeen[it.id] = t }
         clock.reset(); drift.reset()
@@ -429,38 +520,41 @@ class PartySession(
 
     /** Bring the local player to [s]: media, play/pause, position on explicit changes. */
     private fun applyRoom(s: RoomState, explicit: Boolean) {
-        if (st.detached) return
+        if (st.detached || left) return
         val media = s.media
         if (media != null && !media.sameAs(player.currentMedia())) {
             if (!media.sameAs(opening)) {
                 opening = media
-                scope.launch {
-                    val ok = runCatching { player.open(media) }.getOrDefault(false)
+                openJob = launchSafe {
+                    val ok = try { player.open(media) } catch (e: CancellationException) { throw e } catch (e: Exception) { log("party: open failed: $e"); false }
                     if (media.sameAs(opening)) opening = null
                     _ui.update { it.copy(noSource = !ok) }
                     forceStatus = true
+                    settleUntil = now() + config.settleMs
                     if (ok) applyRoom(st.room, explicit = true) else _events.emit(PartyEvent.NoSource(media))
                 }
             }
             return
         }
+        if (!synced()) return // where the room is becomes known with the first pong (onPong applies it then)
+        if (!explicit && holding()) return // own optimistic action not answered yet: a heartbeat must not undo it
         if (s.startsLaterThan(hostNow())) {
             // Scheduled start: wait paused on the start frame, then start exactly at atHostMs.
             if (player.isPlaying()) player.pause()
             if (abs(player.positionMs() - s.positionMs) > 20) player.seek(s.positionMs)
             setSpeed(s.speed)
             startJob?.cancel()
-            startJob = scope.launch {
+            startJob = launchSafe {
                 delay((s.atHostMs - hostNow()).coerceAtLeast(0))
                 if (st.room.seq == s.seq) applyRoom(st.room, explicit = false)
             }
             return
         }
-        if (s.playing) { if (!player.isPlaying()) player.play() } else if (player.isPlaying()) player.pause()
+        if (s.playing) { if (!player.isPlaying()) { player.play(); settleUntil = now() + config.settleMs } } else if (player.isPlaying()) player.pause()
         val target = s.positionAt(hostNow())
         val off = abs(target - player.positionMs())
         // Paused: land on the room's exact frame (a pause arrives one network delay late; a paused seek is cheap).
-        if ((explicit && off > 1000) || (!s.playing && off > 40)) { player.seek(target); drift.reset() }
+        if ((explicit && off > 1000) || (!s.playing && off > 40)) { player.seek(target); drift.reset(); settleUntil = now() + config.settleMs }
         setSpeed(s.speed)
     }
 
@@ -471,6 +565,8 @@ class PartySession(
         if ((pingsSent < 4 && t - lastPingAt >= 1000) || t - lastPingAt >= config.pingEveryMs) ping()
         if (t - (lastSeen[st.hostId] ?: t) > config.hostTimeoutMs) { elect(); return }
         val r = st.room
+        if (!clock.synced || holding()) return
+        if (holdPending) { holdPending = false; drift.reset(); applyRoom(r, explicit = true); return } // never answered: back to the room
         if (st.detached || opening != null || r.media?.sameAs(player.currentMedia()) == false) return
         if (!r.playing) { setSpeed(r.speed); return }
         if (r.startsLaterThan(t + clock.offsetMs)) return // scheduled start pending
@@ -525,13 +621,25 @@ class PartySession(
         send(Ping(selfId, st.hostId, pingsSent, now()))
     }
 
-    private suspend fun send(m: PartyMsg) = transport.send(key.seal(PartyCodec.encode(m)))
+    private suspend fun send(m: PartyMsg) = transport.send(key.seal(PartyCodec.encode(m, ++sendCounter)))
 
     private fun describe(by: String, a: Action, s: RoomState): String = nameOf(by) + when (a) {
         Action.Play -> " pressed play"
         Action.Pause -> " paused at ${fmt(s.positionMs)}"
         Action.Seek -> " jumped to ${fmt(s.positionMs)}"
         Action.Episode -> " started ${s.media?.episodeLabel ?: "the next episode"}"
+    }
+
+    /** Accepts each frame number once, and none older than [size] behind the newest (frames reorder across brokers). */
+    private class ReplayWindow(private val size: Int = 512) {
+        private var max = Long.MIN_VALUE
+        private val seen = HashSet<Long>()
+        fun accept(n: Long): Boolean {
+            if (max != Long.MIN_VALUE && n <= max - size) return false
+            if (!seen.add(n)) return false
+            if (n > max) { max = n; seen.removeAll { it <= max - size } }
+            return true
+        }
     }
 
     companion object {

@@ -1,5 +1,6 @@
 package cloudstream.desktop.app.party
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -8,10 +9,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.URI
 
 /**
@@ -20,11 +23,15 @@ import java.net.URI
  * encrypted ([PartyKey]); a broker sees a topic derived from the room id and ciphertext, nothing else.
  *
  * Dedup and self-echo: a frame starts with its random 12-byte nonce, used as its id.
+ * Sending never waits on a broker (see [MqttWs.publish]): a slow or dead broker cannot hold the session up.
  */
 class PublicRelayTransport(
     roomId: String,
     private val brokers: List<URI> = DEFAULT_BROKERS,
     private val scope: CoroutineScope,
+    private val pingEveryMs: Long = 10_000,
+    private val deadAfterMs: Long = 25_000,
+    private val minBackoffMs: Long = 1000,
     private val log: (String) -> Unit = {},
 ) : PartyTransport {
     val topic = "wp1/$roomId"
@@ -45,30 +52,35 @@ class PublicRelayTransport(
     /** Connects to every broker in the background, reconnecting with backoff. Returns at once. */
     fun start() { brokers.forEach { u -> jobs += scope.launch(Dispatchers.IO) { keepConnected(u) } } }
 
+    override suspend fun awaitReady() { withTimeoutOrNull(10_000) { connected.first { it.isNotEmpty() } } }
+
     private suspend fun keepConnected(u: URI) {
-        var backoff = 1000L
+        var backoff = minBackoffMs
         while (scope.isActive && !closing) {
-            val done = kotlinx.coroutines.CompletableDeferred<String>()
-            val c = MqttWs(u, onMessage = { _, p -> onFrame(p) }, onClosed = { done.complete(it) })
+            val done = CompletableDeferred<String>()
+            val c = MqttWs(u, onMessage = { _, p -> onFrame(p) }, onClosed = { done.complete(it) },
+                pingEveryMs = pingEveryMs, deadAfterMs = deadAfterMs)
             val t0 = System.nanoTime()
             try {
                 c.connect(clientId + "-" + brokers.indexOf(u))
                 c.subscribe(topic)
-                conns[u] = c; _connected.value = conns.keys.toSet()
+                conns[u] = c; publishConnected()
                 log("relay ${u.host}: connected in ${(System.nanoTime() - t0) / 1_000_000} ms")
-                backoff = 1000L
+                backoff = minBackoffMs
                 log("relay ${u.host}: closed (${done.await()})")
             } catch (e: kotlinx.coroutines.CancellationException) {
-                c.close(); throw e
+                c.close(); conns.remove(u, c); publishConnected(); throw e
             } catch (e: Exception) {
                 log("relay ${u.host}: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
                 c.close()
             }
-            conns.remove(u); _connected.value = conns.keys.toSet()
+            conns.remove(u, c); publishConnected()
             if (closing) return
             delay(backoff); backoff = (backoff * 2).coerceAtMost(30_000)
         }
     }
+
+    private fun publishConnected() { _connected.value = conns.keys.toSet() }
 
     private fun idOf(frame: ByteArray) = frame.copyOfRange(0, minOf(12, frame.size)).joinToString("") { "%02x".format(it) }
 
@@ -80,11 +92,8 @@ class PublicRelayTransport(
 
     override suspend fun send(frame: ByteArray) {
         synchronized(seen) { seen[idOf(frame)] = Unit } // our own echo comes back from every broker: drop it
-        val targets = conns.values.filter { it.isOpen }
-        if (targets.isEmpty()) return // the session's heartbeats re-send state once a broker is back
-        withContext(Dispatchers.IO) {
-            targets.forEach { c -> runCatching { c.publish(topic, frame) }.onFailure { log("relay ${c.url.host}: publish failed: ${it.message}") } }
-        }
+        // Queued per broker, returns at once; the session's heartbeats re-send state once a broker is back.
+        conns.values.filter { it.isOpen }.forEach { c -> c.publish(topic, frame) }
     }
 
     override suspend fun close() {

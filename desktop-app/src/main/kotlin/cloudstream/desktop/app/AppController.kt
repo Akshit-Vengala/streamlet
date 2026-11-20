@@ -33,6 +33,9 @@ class AppController(val services: AppServices) {
         )
     }
 
+    /** Watch party (at most one; survives screen changes). */
+    val party = cloudstream.desktop.app.party.PartyManager(this)
+
     /** App self-updater (GitHub Releases of the repo set at build time; off when none). */
     val updater = cloudstream.desktop.app.update.AppUpdater(services.scope)
 

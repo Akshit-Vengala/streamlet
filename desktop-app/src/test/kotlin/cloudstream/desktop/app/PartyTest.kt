@@ -43,6 +43,19 @@ class PartyKeyTest {
         assertNull(PartyCodec.decode("""{"t":"FutureThing","from":"x"}""".toByteArray()))
         assertNull(PartyCodec.decode("not json".toByteArray()))
     }
+
+    @Test fun `incomplete or out-of-range frames are rejected, not half-decoded`() {
+        fun d(json: String) = PartyCodec.decode(json.toByteArray())
+        assertNull(d("""{"t":"Hello","from":"x"}"""), "missing name")
+        assertNotNull(d("""{"t":"Hello","from":"x","name":"Ann"}"""))
+        assertNull(d("""{"t":"StateMsg","from":"h","room":{"speed":0}}"""), "speed 0 would freeze the timeline")
+        assertNull(d("""{"t":"Roster","from":"h","members":[{"id":"a"}],"hostId":"a","mode":"Everyone"}"""), "member without name")
+        assertNull(d("""{"t":"Roster","from":"h","members":[],"hostId":"a","mode":"Anarchy"}"""), "unknown enum")
+        assertNull(d("""{"t":"Request","from":"g","action":"Pause"}"""), "missing baseSeq")
+        assertNull(d("""{"t":"Request","from":"g","action":"Episode","baseSeq":1,"media":{"titleUrl":"u"}}"""), "incomplete media")
+        val r = Request("g", Action.Episode, 0, media("2"), 4)
+        assertEquals(PartyFrame(r, 77), PartyCodec.decodeFrame(PartyCodec.encode(r, 77)))
+    }
 }
 
 class PartyClockTest {
@@ -89,6 +102,8 @@ class FakePlayer(private val clock: () -> Long, var media: MediaRef? = null) : P
     var openDelayMs = 0L
     var canOpen = true
     var seeks = 0
+    val seekLog = ArrayList<Long>()
+    var failNextPlay = false
     private var last = clock()
 
     private fun advance() {
@@ -103,10 +118,11 @@ class FakePlayer(private val clock: () -> Long, var media: MediaRef? = null) : P
     override fun isPlaying() = playing
     override fun isBuffering() = clock() < stallUntil
     override fun aheadMs(): Long? = if (isBuffering()) 0 else 30_000
-    override fun play() { advance(); playing = true }
+    override fun play() { if (failNextPlay) { failNextPlay = false; error("player hiccup") }; advance(); playing = true }
     override fun pause() { advance(); playing = false }
-    override fun seek(ms: Long) { advance(); pos = ms.toDouble(); seeks++; if (seekStallMs > 0) stallUntil = clock() + seekStallMs }
+    override fun seek(ms: Long) { advance(); pos = ms.toDouble(); seeks++; seekLog += ms; if (seekStallMs > 0) stallUntil = clock() + seekStallMs }
     override fun setSpeed(speed: Double) { advance(); curSpeed = speed }
+    override fun speed() = curSpeed
     override fun currentMedia() = media
     override suspend fun open(media: MediaRef): Boolean {
         delay(openDelayMs)
@@ -334,5 +350,104 @@ class PartySessionTest {
         wait(1000)
         assertEquals(listOf("host"), host.ui.members.map { it.id })
     }
-}
 
+    @Test fun `a short host stall moves the room timeline to the host's video`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000)
+        host.session.play(); wait(5000)
+        host.player.stall(1000); wait(1200) // under the 1.5 s "ignore" limit: the room does not wait
+        assertTrue(host.player.playing && !host.ui.room.waiting)
+        wait(40_000)
+        assertNear(host.player.positionMs(), host.ui.room.positionAt(testScheduler.currentTime), 100, "timeline follows the host's video")
+        assertNear(host.player.positionMs(), guest.player.positionMs(), 150, "guest is with the host, not with the old timeline")
+    }
+
+    @Test fun `a guest's own seek is not undone while the host's answer is on its way`() = runTest {
+        relay = InMemoryRelay(latencyMs = 300, scope = backgroundScope)
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.session.host(); runCurrent(); guest.session.join(); wait(6000)
+        host.session.play(); wait(8000)
+        guest.player.seekLog.clear()
+        guest.session.seek(300_000); wait(5000)
+        assertTrue(guest.player.seekLog.all { it >= 299_000 }, "no seek back to the old position: ${guest.player.seekLog}")
+        assertNear(300_000, host.player.positionMs(), 6000, "host followed")
+    }
+
+    @Test fun `an optimistic action the host drops snaps back to the room`() = runTest {
+        val host = peer("host", config = PartyConfig(maxRequestsPerSecond = 0), media = media("1")) // drops every request
+        val guest = peer("guest")
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000)
+        host.session.play(); wait(3000)
+        guest.session.pause(); wait(500)
+        assertFalse(guest.player.playing, "paused locally at once")
+        wait(3000)
+        assertTrue(guest.player.playing, "no answer: back with the room")
+        assertNear(host.player.positionMs(), guest.player.positionMs(), 300, "in sync")
+    }
+
+    @Test fun `a guest with a wildly different clock joins a playing room without wild seeks`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest", skewMs = 3 * 3600_000L) // monotonic clocks: hours apart is normal
+        host.session.host(); runCurrent()
+        host.session.play(); wait(60_000)
+        guest.session.join(); wait(10_000)
+        assertNear(host.player.positionMs(), guest.player.positionMs(), 300, "in sync")
+        assertTrue(guest.player.seekLog.all { abs(it - 62_000) < 10_000 }, "only sensible seeks: ${guest.player.seekLog}")
+    }
+
+    @Test fun `requests from non-members and replayed frames are ignored`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        val sniffed = ArrayList<ByteArray>()
+        val tap = relay.connect()
+        backgroundScope.launch { tap.incoming.collect { sniffed += it } }
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000) // the tap records everything, Hello included
+        host.session.play(); wait(3000)
+
+        tap.send(key.seal(PartyCodec.encode(Request("stranger", Action.Pause, baseSeq = 99), 1))); wait(1000)
+        assertTrue(host.player.playing, "someone with the key but not in the room cannot control it")
+
+        guest.session.pause(); wait(1000)
+        assertFalse(host.player.playing)
+        host.session.play(); wait(3000)
+        assertTrue(host.player.playing)
+        sniffed.toList().forEach { tap.send(it) }; wait(1000) // the whole stream again: Hello first, then the pause
+        assertTrue(host.player.playing, "replayed pause ignored")
+    }
+
+    @Test fun `no bogus host-change toast when a heartbeat roster beats the welcome`() = runTest {
+        relay = InMemoryRelay(latencyMs = 150, scope = backgroundScope)
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.session.host(); wait(4900)
+        guest.session.join(); wait(3000) // hello lands ~5050, the heartbeat roster sent at 5000 reaches the guest first
+        assertEquals("host", guest.ui.hostId)
+        assertFalse(guest.events.any { it is PartyEvent.Toast && "is now the host" in it.text }, guest.events.toString())
+    }
+
+    @Test fun `leaving cancels a pending scheduled start and restores the own speed`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.player.curSpeed = 1.25
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000)
+        assertEquals(1.0, host.player.curSpeed, "speed is room state in a party")
+        host.session.play(); wait(100) // starts 400 ms from now
+        host.session.leave(); wait(2000)
+        assertFalse(host.player.playing, "nothing starts after leaving")
+        assertEquals(1.25, host.player.curSpeed)
+    }
+
+    @Test fun `a player that throws does not stop the session`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000)
+        guest.player.failNextPlay = true
+        host.session.play(); wait(5000)
+        host.session.pause(); wait(1000)
+        host.session.play(); wait(5000)
+        assertTrue(guest.player.playing, "still following after the failure")
+        assertNear(host.player.positionMs(), guest.player.positionMs(), 300, "in sync")
+    }
+}

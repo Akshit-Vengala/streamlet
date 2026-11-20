@@ -123,7 +123,8 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
             val stack by c.nav.stack.collectAsStateCompat()
             val current = stack.last()
             val snack = remember { SnackbarHostState() }
-            LaunchedEffect(Unit) { c.services.toasts.collect { snack.showSnackbar(it) } }
+            // The player shows its own toasts (above its seek bar): not here too, or every message appears twice.
+            LaunchedEffect(Unit) { c.services.toasts.collect { if (c.nav.current !is Screen.Player) snack.showSnackbar(it) } }
             val profile by c.services.profiles.current.collectAsStateCompat()
             var picking by remember { mutableStateOf(c.services.profiles.askOnStart) }
             if (picking) { ProfilePicker(c) { picking = false }; return@Surface }
@@ -149,7 +150,7 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
                             DownloadDialog(c, p.card, p.details, p.episode, prompt = p) { c.seasonDownloads.dismiss(p) }
                         }
                     }
-                    Column(Modifier.align(Alignment.BottomCenter).padding(16.dp)) { SnackbarHost(snack) }
+                    if (current !is Screen.Player) Column(Modifier.align(Alignment.BottomCenter).padding(16.dp)) { SnackbarHost(snack) }
                 }
             }
         }
@@ -187,6 +188,7 @@ private fun TopBar(c: AppController, root: Screen) {
             Spacer(Modifier.width(18.dp))
             navItems.forEach { item -> NavLink(item.label, root == item.screen) { c.goTo(item.screen) } }
         }
+        PartyChip(c)
         ProfileRailButton(c)
     }
 }

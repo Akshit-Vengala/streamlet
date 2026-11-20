@@ -10,6 +10,8 @@ interface PartyTransport {
     val incoming: Flow<ByteArray>
     suspend fun send(frame: ByteArray)
     suspend fun close()
+    /** Suspends until frames can actually be sent (or a transport-specific timeout passes). */
+    suspend fun awaitReady() {}
 }
 
 /**

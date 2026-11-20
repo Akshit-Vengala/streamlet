@@ -196,6 +196,8 @@ class PlayerUi {
     var subtitleTracks: () -> List<cloudstream.desktop.player.MediaTrack> = { emptyList() }
     var onAudioTrack: (Int) -> Unit = {}
     var onSubtitleTrack: (Int?) -> Unit = {}
+    /** Watch party panel (start / invite / members / chat). */
+    var onParty: () -> Unit = {}
     /** Extra dialog content shown on top of the controls (online subtitle search). */
     var extraDialog: (@Composable () -> Unit)? by mutableStateOf(null)
 }
@@ -458,6 +460,7 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
                     if (ui.audioList.size > 1) PlayerIconButton("♪  Audio") { dialog = "audio" }
                     ui.skip?.let { seg -> PlayerIconButton("⏩  ${seg.kind.label}") { ui.onSkip() } }
                     if (ui.hasNext) PlayerIconButton("⏭  Next episode") { ui.onNext() }
+                    PlayerIconButton("◎  Watch party") { ui.onParty() }
                 }
                 st.error?.let { Text(it, color = Color(0xFFFF8A80), fontSize = 12.sp, maxLines = 2, modifier = Modifier.align(Alignment.CenterHorizontally)) }
             }

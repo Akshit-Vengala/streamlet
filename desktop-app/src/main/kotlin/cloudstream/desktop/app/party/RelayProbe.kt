@@ -75,6 +75,7 @@ object RelayProbe {
         @Synchronized override fun pause() { adv(); playing = false }
         @Synchronized override fun seek(ms: Long) { adv(); pos = ms.toDouble() }
         @Synchronized override fun setSpeed(speed: Double) { adv(); this.speed = speed }
+        override fun speed() = speed
         override fun currentMedia() = media
         override suspend fun open(media: MediaRef): Boolean { this.media = media; seek(0); return true }
     }
@@ -130,11 +131,13 @@ object RelayProbe {
             // Redundancy: the guest loses one broker; the room must not notice.
             val lost = brokers.first()
             tGuest.dropForTest(lost)
+            check(until(2_000) { lost !in tGuest.connected.value } != null, "${lost.host} dropped (left the connected set)")
             delay(200)
             hs.pause()
             val afterDropMs = until(5_000) { !gp.isPlaying() }
             check(afterDropMs != null, "with ${lost.host} gone, pause still arrived in $afterDropMs ms (via the others)")
-            check(until(40_000) { lost in tGuest.connected.value } != null, "${lost.host} reconnected by itself")
+            val backMs = until(40_000) { lost in tGuest.connected.value }
+            check(backMs != null, "${lost.host} reconnected by itself in $backMs ms")
 
             val soak = System.getenv("RELAY_SOAK")?.toLongOrNull() ?: 0
             if (soak > 0) {
