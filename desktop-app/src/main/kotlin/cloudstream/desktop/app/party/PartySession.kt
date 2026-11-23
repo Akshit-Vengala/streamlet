@@ -62,6 +62,8 @@ data class PartyConfig(
     val reanchorGapMs: Long = 5000,
     /** Guest: after an own play/pause/seek, how long to wait for the host's answer before snapping back to the room. */
     val optimisticHoldMs: Long = 2000,
+    /** Host: a speed change is sent once the speed has stayed put this long. */
+    val speedDebounceMs: Long = 300,
 )
 
 data class MemberStatus(
@@ -94,9 +96,11 @@ data class PartyUi(
 sealed interface PartyEvent {
     data class Toast(val text: String) : PartyEvent
     data class ChatLine(val name: String, val text: String, val self: Boolean) : PartyEvent
-    data class Reaction(val name: String, val emoji: String) : PartyEvent
+    data class Reaction(val name: String, val emoji: String, val self: Boolean = false) : PartyEvent
     /** Someone without control asked for [action] (shown to the host). */
     data class Nudge(val name: String, val action: Action) : PartyEvent
+    /** The host ended the party: the app leaves it. */
+    data object Ended : PartyEvent
     /** This member cannot play what the room plays: offer install / source picker. */
     data class NoSource(val media: MediaRef) : PartyEvent
 }
@@ -157,6 +161,11 @@ class PartySession(
     private var holdUntil = Long.MIN_VALUE / 2
     private fun holding() = now() < holdUntil
     private var holdPending = false
+    /** Host: a speed change waits a moment so a dragged slider sends one change, not dozens. */
+    private var speedJob: Job? = null
+    /** Guest without control: last "only the host" toast; host: last nudge shown per member (both throttled). */
+    private var lastAskToastAt = Long.MIN_VALUE / 2
+    private val lastNudgeAt = HashMap<String, Long>()
     /** Frame counters: own (starts high so a restarted session never reuses old numbers), and a window per sender. */
     private var sendCounter = System.currentTimeMillis() * 1000
     private val windows = HashMap<String, ReplayWindow>()
@@ -203,12 +212,26 @@ class PartySession(
         try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) { log("party: $what failed: $e") }
     }
 
-    suspend fun leave() = withContext(scope.coroutineContext[ContinuationInterceptor] ?: EmptyCoroutineContext) {
+    /**
+     * Leave the room. A host hands the role to the longest-connected member first (the same one a guest election would
+     * pick, so a lost hand-off message changes nothing), unless [endForAll]: then the room closes for everyone.
+     */
+    suspend fun leave(endForAll: Boolean = false) = withContext(scope.coroutineContext[ContinuationInterceptor] ?: EmptyCoroutineContext) {
         if (left) return@withContext
         left = true
-        startJob?.cancel(); openJob?.cancel()
+        startJob?.cancel(); openJob?.cancel(); speedJob?.cancel()
         jobs.forEach { it.cancel() }
-        try { send(Bye(selfId)) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+        try {
+            if (st.isHost && endForAll) repeat(2) { send(End(selfId)) }
+            else if (st.isHost) {
+                val rest = st.members.filter { it.id != selfId }.sortedBy { it.joinedAt }
+                rest.firstOrNull()?.let { next ->
+                    _ui.update { it.copy(hostId = next.id, members = rest) }
+                    send(Roster(selfId, rest, next.id, st.mode))
+                }
+            }
+            send(Bye(selfId))
+        } catch (e: CancellationException) { throw e } catch (_: Exception) {}
         try { transport.close() } catch (e: CancellationException) { throw e } catch (_: Exception) {}
         player.setSpeed(speedBefore)
         _ui.update { it.copy(connected = false) }
@@ -240,7 +263,11 @@ class PartySession(
             }
             else -> {
                 send(Request(selfId, a, pos, media, st.room.seq))
-                _events.emit(PartyEvent.Toast("Asked the host to ${a.name.lowercase()}"))
+                val t = now()
+                if (t - lastAskToastAt >= ASK_TOAST_GAP_MS) {
+                    lastAskToastAt = t
+                    _events.emit(PartyEvent.Toast("Only the host controls playback - asked them to ${a.name.lowercase()}"))
+                }
             }
         }
     }
@@ -269,7 +296,25 @@ class PartySession(
     }
 
     fun react(emoji: String) = launchSafe {
-        send(React(selfId, emoji.take(8))); _events.emit(PartyEvent.Reaction(selfName, emoji.take(8)))
+        send(React(selfId, emoji.take(8))); _events.emit(PartyEvent.Reaction(selfName, emoji.take(8), self = true))
+    }
+
+    /**
+     * Host: play everyone at [speed]. Applied after a short pause, so dragging the speed slider sends only where it
+     * stops. Speed travels in [RoomState] (no new [Action]: older clients would drop a state with an unknown action).
+     */
+    fun changeSpeed(speed: Double) = launchSafe {
+        if (left || !st.isHost) return@launchSafe
+        val x = (Math.round(speed.coerceIn(MIN_SPEED, MAX_SPEED) * 100) / 100.0)
+        speedJob?.cancel()
+        speedJob = launchSafe {
+            delay(config.speedDebounceMs)
+            val r = st.room
+            if (!st.isHost || r.speed == x) return@launchSafe
+            val t = now()
+            // Rebase the timeline at the change: positionAt multiplies elapsed time by speed.
+            setRoom(r.copy(speed = x, positionMs = r.positionAt(t), atHostMs = if (r.startsLaterThan(t)) r.atHostMs else t))
+        }
     }
 
     fun setMode(mode: ControlMode) = hostOnly { _ui.update { it.copy(mode = mode) } }
@@ -319,8 +364,9 @@ class PartySession(
             is Request -> if (st.isHost) onRequest(m)
             is Status -> recordStatus(m.from, m.buffering, m.aheadMs, m.detached, m.noSource)
             is Chat -> _events.emit(PartyEvent.ChatLine(nameOf(m.from), m.text.take(500), self = false))
-            is React -> _events.emit(PartyEvent.Reaction(nameOf(m.from), m.emoji.take(8)))
+            is React -> _events.emit(PartyEvent.Reaction(nameOf(m.from), m.emoji.take(8), self = false))
             is Bye -> onBye(m.from)
+            is End -> if (m.from == st.hostId && !st.isHost) _events.emit(PartyEvent.Ended)
         }
     }
 
@@ -334,8 +380,9 @@ class PartySession(
     private suspend fun onHello(m: Hello) {
         if (st.member(m.from) == null) {
             val order = (st.members.maxOfOrNull { it.joinedAt } ?: 0) + 1
-            _ui.update { it.copy(members = it.members + Member(m.from, m.name.take(40), order)) }
-            _events.emit(PartyEvent.Toast("${m.name.take(40)} joined"))
+            val name = uniqueName(m.name.trim().take(40).ifEmpty { "Guest" })
+            _ui.update { it.copy(members = it.members + Member(m.from, name, order)) }
+            _events.emit(PartyEvent.Toast("$name joined"))
         }
         send(Welcome(selfId, m.from, st.members, st.hostId, st.mode, st.room))
         send(Roster(selfId, st.members, st.hostId, st.mode))
@@ -374,8 +421,10 @@ class PartySession(
         if (s.seq < st.room.seq) return
         val explicit = s.seq > st.room.seq
         if (s.seq > holdSeq) { holdUntil = Long.MIN_VALUE / 2; holdPending = false } // the host has answered (or moved on)
+        val speedChanged = explicit && s.speed != st.room.speed && st.room.seq > 0
         _ui.update { it.copy(room = s) }
         if (s.waiting) forceStatus = true
+        if (speedChanged) _events.emit(PartyEvent.Toast("${nameOf(st.hostId)} set the speed to ${fmtSpeed(s.speed)}x"))
         if (explicit && m.by != null && m.by != selfId && m.action != null) _events.emit(PartyEvent.Toast(describe(m.by, m.action, s)))
         applyRoom(s, explicit)
     }
@@ -386,7 +435,11 @@ class PartySession(
         while (q.isNotEmpty() && t - q.first() > 1000) q.removeFirst()
         if (q.size >= config.maxRequestsPerSecond) return
         q.addLast(t)
-        if (!st.canControl(m.from)) { _events.emit(PartyEvent.Nudge(nameOf(m.from), m.action)); return }
+        if (!st.canControl(m.from)) {
+            // One nudge per member every few seconds: a guest holding a key must not flood the host with popups.
+            if (t - (lastNudgeAt[m.from] ?: Long.MIN_VALUE / 2) >= ASK_TOAST_GAP_MS) { lastNudgeAt[m.from] = t; _events.emit(PartyEvent.Nudge(nameOf(m.from), m.action)) }
+            return
+        }
         // A seek made against a timeline someone else has since moved is stale: drop it rather than jump back.
         val (changedSeq, changedBy) = lastPositionChange
         if (m.action == Action.Seek && changedSeq > m.baseSeq && changedBy != m.from) return
@@ -477,6 +530,13 @@ class PartySession(
                 }
             }
         }
+    }
+
+    /** Two members never share a name in the room ("Sam", "Sam 2"): the roster, chat and logs stay readable. */
+    private fun uniqueName(name: String): String {
+        val taken = st.members.map { it.name.lowercase() }.toSet()
+        if (name.lowercase() !in taken) return name
+        return (2..999).asSequence().map { "$name $it" }.first { it.lowercase() !in taken }
     }
 
     private suspend fun removeMembers(ids: List<String>, left: Boolean) {
@@ -643,6 +703,10 @@ class PartySession(
     }
 
     companion object {
+        const val MIN_SPEED = 0.1
+        const val MAX_SPEED = 4.0
+        private const val ASK_TOAST_GAP_MS = 3000L
+        fun fmtSpeed(x: Double): String = "%.2f".format(java.util.Locale.ROOT, x).trimEnd('0').trimEnd('.')
         fun fmt(ms: Long): String {
             val sec = ms / 1000
             val h = sec / 3600; val m = (sec % 3600) / 60; val s = sec % 60

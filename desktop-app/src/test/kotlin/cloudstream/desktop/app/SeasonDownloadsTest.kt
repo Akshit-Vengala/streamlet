@@ -80,7 +80,9 @@ class SeasonDownloadsTest {
             season.start(card, details, eps, SourceChoice("ServerA", "ServerA 1080p", 1080, setOf("English")))
 
             val end = System.currentTimeMillis() + 10_000
-            while (System.currentTimeMillis() < end && (season.looking.value.isNotEmpty() || season.prompts.value.isEmpty())) Thread.sleep(30)
+            // Lookups end, the prompt appears AND both downloads are queued (on a slow CI machine these land apart).
+            while (System.currentTimeMillis() < end && (season.looking.value.isNotEmpty() || season.prompts.value.isEmpty() ||
+                    downloads.items.value.size < 2)) Thread.sleep(30)
             assertTrue(season.looking.value.isEmpty(), "all lookups finished")
             val items = downloads.items.value.associateBy { it.episodeData }
             assertEquals(setOf("e2", "e4"), items.keys)

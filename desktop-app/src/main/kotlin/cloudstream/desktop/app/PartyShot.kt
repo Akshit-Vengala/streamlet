@@ -63,7 +63,7 @@ object PartyShot {
                 val ep = vm.playTarget() ?: run { log("nothing to play"); return 2 }
                 c.playEpisode(vm, ep)
                 if (!waitFor(150_000, "video playing") { (PlayerDebug.player?.property("time-pos")?.toDoubleOrNull() ?: 0.0) > 1.0 }) return 2
-                c.party.start()
+                c.party.start("")
                 val code = c.party.active.value!!.code
                 codeFile.writeText(code); log("party code written")
                 if (!waitFor(120_000, "guest joined") { (c.party.session?.ui?.value?.members?.size ?: 0) >= 2 }) return 2
@@ -76,13 +76,16 @@ object PartyShot {
                 log("ACTION pause"); c.party.session!!.pause(); frames(5000); status()
                 log("ACTION seek 600000"); c.party.seek(600_000); frames(8000); status()
                 log("ACTION play"); c.party.session!!.play(); frames(20_000); status(); shot("2-after-seek")
+                log("ACTION speed 1.5"); c.party.changeSpeed(1.5); frames(10_000); status()
+                log("ACTION speed 1.0"); c.party.changeSpeed(1.0); frames(8000); status()
                 c.party.session!!.chat("hello from host")
                 frames(5000); status()
+                log("ACTION leave (hand host on)")
                 log("ACTION done"); frames(10_000)
             } else {
                 if (!waitFor(400_000, "code file") { codeFile.isFile && codeFile.readText().isNotBlank() }) return 2
                 val code = codeFile.readText().trim()
-                check(c.party.join(code)) { "bad code" }
+                check(c.party.join(code, "")) { "bad code" }
                 val end = System.currentTimeMillis() + secs * 1000
                 var n = 0
                 while (System.currentTimeMillis() < end) {

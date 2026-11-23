@@ -126,14 +126,17 @@ class FakeBroker : AutoCloseable {
 }
 
 class PartyRelayTest {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Errors from the real-thread coroutines: reported HERE, not by whichever coroutine test happens to run next. */
+    private val leaked = CopyOnWriteArrayList<Throwable>()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> leaked += e })
     private val brokers = ArrayList<FakeBroker>()
     private val transports = ArrayList<PublicRelayTransport>()
 
-    @AfterTest fun tearDown() = runBlocking {
-        transports.forEach { it.close() }
+    @AfterTest fun tearDown() {
+        runBlocking { transports.forEach { it.close() } }
         brokers.forEach { it.close() }
         scope.cancel()
+        leaked.firstOrNull()?.let { throw AssertionError("a background coroutine failed", it) }
     }
 
     private fun broker() = FakeBroker().also { brokers += it }

@@ -96,6 +96,11 @@ class AppSettings(
     val playbackSpeed: StateFlow<Double> = _speed.asStateFlow()
     fun setPlaybackSpeed(s: Double) { val v = s.coerceIn(0.1, 4.0); _speed.value = v; kv.set("ui/playbackSpeed", v) }
 
+    private val _partyName = MutableStateFlow(str("partyName") ?: "")
+    /** The name shown to others in a watch party (machine-wide; read from the default profile's settings). */
+    val partyName: StateFlow<String> = _partyName.asStateFlow()
+    fun setPartyName(n: String) { val v = n.trim().take(40); _partyName.value = v; kv.set("ui/partyName", v) }
+
     private val _extUpdates = MutableStateFlow(str("extUpdates")?.let { n -> ExtUpdateMode.entries.firstOrNull { it.name == n } } ?: ExtUpdateMode.Auto)
     /** Extension updates (machine-wide; read from the default profile's settings). */
     val extUpdates: StateFlow<ExtUpdateMode> = _extUpdates.asStateFlow()

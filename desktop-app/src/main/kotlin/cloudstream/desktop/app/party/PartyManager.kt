@@ -94,46 +94,55 @@ class PartyManager(private val c: AppController) {
 
     // ---- start / join / leave ------------------------------------------------------------------------------------
 
-    fun start() {
+    /** The name to offer in the start / join forms: the last one used, else the profile's, else the OS user's. */
+    fun defaultName(): String = c.services.globalSettings.partyName.value.ifBlank {
+        c.services.profiles.current.value.name.takeIf { it.isNotBlank() && !it.equals("Default", ignoreCase = true) }
+            ?: System.getProperty("user.name").orEmpty()
+    }
+
+    /** Guests watch what the host plays: only the host controls play / pause / seek / speed (see [PartySession.setMode]). */
+    fun start(name: String) {
         if (isActive) return
         val key = PartyKey.random()
-        val s = open(key) ?: return
-        s.host()
+        val s = open(key, name) ?: return
+        s.host(ControlMode.HostOnly)
         _chat.value = listOf(PartyChatLine("", "Watch party started. Share the code: ${key.code}", self = false, system = true))
         copyToClipboard(key.code)
         c.services.toast("Watch party started - invite code copied:\n${key.code}")
     }
 
     /** false = not a valid code. */
-    fun join(code: String): Boolean {
+    fun join(code: String, name: String): Boolean {
         val key = PartyKey.parse(code) ?: return false
         leave()
-        val s = open(key) ?: return false
+        val s = open(key, name) ?: return false
         s.join()
         _chat.value = listOf(PartyChatLine("", "Joining...", self = false, system = true))
         c.services.toast("Joining the watch party...")
         return true
     }
 
-    fun leave() {
+    /** Leave the party (a host hands it to someone else first); [endForAll] (host only) closes it for everyone. */
+    fun leave(endForAll: Boolean = false) {
         val info = _active.value ?: return
         _active.value = null
         watchJob?.cancel()
         targetRoomMedia = null; pending = null
-        c.services.scope.launch { shutdown(info) }
+        c.services.scope.launch { shutdown(info, endForAll) }
     }
 
-    private suspend fun shutdown(info: PartyInfo) {
-        runCatching { info.session.leave() }
+    private suspend fun shutdown(info: PartyInfo, endForAll: Boolean = false) {
+        runCatching { info.session.leave(endForAll) }
         info.scope.cancel()
         log.info("Left the watch party")
     }
 
-    private fun open(key: PartyKey): PartySession? {
+    private fun open(key: PartyKey, chosenName: String): PartySession? {
         val sc = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
         val transport = PublicRelayTransport(key.roomId, scope = c.services.scope, log = { log.info(it) })
         transport.start()
-        val name = c.services.profiles.current.value.name.ifBlank { System.getProperty("user.name") ?: "Guest" }
+        val name = chosenName.trim().take(40).ifBlank { defaultName() }.ifBlank { "Guest" }
+        if (chosenName.isNotBlank()) c.services.globalSettings.setPartyName(name)
         val s = PartySession(key, transport, Adapter(), sc, name, appVersion = cloudstream.desktop.app.update.BuildInfo.version,
             log = { log.info(it) })
         _active.value = PartyInfo(key.code, key.link, s, sc)
@@ -147,10 +156,11 @@ class PartyManager(private val c: AppController) {
 
     private fun onEvent(e: PartyEvent) {
         when (e) {
-            is PartyEvent.Toast -> { c.services.toast(e.text); system(e.text) }
-            is PartyEvent.ChatLine -> { add(PartyChatLine(e.name, e.text, e.self)); if (!e.self) c.services.toast("${e.name}: ${e.text}") }
-            is PartyEvent.Reaction -> { add(PartyChatLine(e.name, e.emoji, e.self())); c.services.toast("${e.name} ${e.emoji}") }
-            is PartyEvent.Nudge -> c.services.toast("${e.name} wants to ${e.action.name.lowercase()}")
+            is PartyEvent.Toast -> { toast(e.text); system(e.text) }
+            is PartyEvent.ChatLine -> { add(PartyChatLine(e.name, e.text, e.self)); if (!e.self) toast("${e.name}: ${e.text}") }
+            is PartyEvent.Reaction -> { add(PartyChatLine(e.name, e.emoji, e.self)); if (!e.self) toast("${e.name} ${e.emoji}") }
+            PartyEvent.Ended -> { c.services.toast("The host ended the watch party"); leave() }
+            is PartyEvent.Nudge -> toast("${e.name} wants to ${e.action.name.lowercase()}")
             is PartyEvent.NoSource -> {
                 val msg = "Could not open \"${e.media.titleName}\" ${e.media.episodeLabel}: " +
                     if (c.providerByName(e.media.apiName) == null) "install the extension that provides ${e.media.apiName}" else "no working source"
@@ -158,7 +168,14 @@ class PartyManager(private val c: AppController) {
             }
         }
     }
-    private fun PartyEvent.Reaction.self() = name == c.services.profiles.current.value.name
+    private var lastToast: Pair<String, Long>? = null
+    /** The same popup again within a couple of seconds (spam, repeats) is shown once; it still goes to the chat log. */
+    private fun toast(text: String) {
+        val t = System.currentTimeMillis()
+        lastToast?.let { (txt, at) -> if (txt == text && t - at < 2500) return }
+        lastToast = text to t
+        c.services.toast(text)
+    }
     private fun system(text: String) = add(PartyChatLine("", text, self = false, system = true))
     private fun add(l: PartyChatLine) { _chat.value = (_chat.value + l).takeLast(200) }
 
@@ -170,6 +187,8 @@ class PartyManager(private val c: AppController) {
         scope?.launch { if (synchronized(lock) { target?.isPlaying() } == true) s.pause() else s.play() }
     }
     fun seek(ms: Long) { session?.seek(ms.coerceAtLeast(0)) }
+    /** Host only: the room's speed (the session waits for the value to settle before sending it). */
+    fun changeSpeed(x: Double) { session?.changeSpeed(x) }
     fun seekBy(deltaMs: Long) {
         val s = session ?: return
         scope?.launch { synchronized(lock) { target?.positionMs() }?.let { s.seek((it + deltaMs).coerceAtLeast(0)) } }

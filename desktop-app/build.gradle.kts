@@ -190,6 +190,8 @@ tasks.withType<JavaExec>().configureEach {
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
     maxHeapSize = "1g"
+    // Full causes in the console (CI logs are all there is when a test fails there).
+    testLogging { exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL; showCauses = true; showStackTraces = true }
     // Live / plugin-executing tests are opt-in: -Pcs.live=true -Pcs.cs3dir=<dir with .cs3>
     systemProperty("cs.live", providers.gradleProperty("cs.live").orElse("false").get())
     systemProperty("cs.cs3dir", providers.gradleProperty("cs.cs3dir").orElse("").get())

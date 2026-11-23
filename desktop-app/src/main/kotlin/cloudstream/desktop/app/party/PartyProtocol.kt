@@ -75,6 +75,8 @@ data class Status(override val from: String, val buffering: Boolean, val aheadMs
 data class Chat(override val from: String, val text: String) : PartyMsg()
 data class React(override val from: String, val emoji: String) : PartyMsg()
 data class Bye(override val from: String) : PartyMsg()
+/** The host closed the room: everyone leaves (older clients ignore it and fall back to electing a new host). */
+data class End(override val from: String) : PartyMsg()
 
 /** A decoded frame: the message and its sender's frame counter [n] (replay protection, see PartySession). */
 data class PartyFrame(val msg: PartyMsg, val n: Long)
@@ -89,7 +91,7 @@ object PartyCodec {
     private val gson = Gson()
     private val types = listOf(
         Hello::class, Welcome::class, Roster::class, StateMsg::class, Ping::class, Pong::class,
-        Request::class, Status::class, Chat::class, React::class, Bye::class,
+        Request::class, Status::class, Chat::class, React::class, Bye::class, End::class,
     ).associate { it.simpleName!! to it.java }
 
     fun encode(m: PartyMsg, n: Long = 0): ByteArray {
@@ -124,7 +126,7 @@ object PartyCodec {
         "Status" -> o.isBool("buffering") && o.isBool("detached") && o.isBool("noSource") && (o.absent("aheadMs") || o.isNum("aheadMs"))
         "Chat" -> o.isStr("text")
         "React" -> o.isStr("emoji")
-        "Bye" -> true
+        "Bye", "End" -> true
         else -> false
     }
 

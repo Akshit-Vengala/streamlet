@@ -40,6 +40,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import cloudstream.desktop.app.AppController
+import cloudstream.desktop.app.party.ControlMode
 import cloudstream.desktop.app.party.PartyInfo
 import cloudstream.desktop.app.party.PartyManager
 
@@ -56,10 +57,31 @@ fun PartyDialog(c: AppController, onDismiss: () -> Unit) {
                 if (i == null) NotInParty(c) else InParty(c, i)
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        // "Hide" only closes this panel: the party keeps running (the top bar chip reopens it).
+        confirmButton = { TextButton(onClick = onDismiss) { Text(if (info != null) "Hide" else "Close") } },
         dismissButton = {
-            if (info != null) TextButton(onClick = { c.party.leave(); onDismiss() }) { Text("Leave party", color = MaterialTheme.colorScheme.error) }
+            val i = info
+            if (i != null) {
+                val ui by i.session.ui.collectAsStateCompat()
+                Row {
+                    if (ui.isHost) TextButton(onClick = { c.party.leave(endForAll = true); onDismiss() }) {
+                        Text("End party", color = MaterialTheme.colorScheme.error)
+                    }
+                    TextButton(onClick = { c.party.leave(); onDismiss() }) {
+                        Text(if (ui.isHost && ui.members.size > 1) "Leave (pass host on)" else "Leave party", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
         },
+    )
+}
+
+/** The name others see in the party (remembered for next time). */
+@Composable
+private fun NameField(name: String, onChange: (String) -> Unit) {
+    OutlinedTextField(
+        name, { onChange(it.take(40)) }, singleLine = true, label = { Text("Your name") },
+        isError = name.isBlank(), modifier = Modifier.fillMaxWidth(),
     )
 }
 
@@ -71,23 +93,28 @@ private fun NotInParty(c: AppController) {
             "\"what and where\" goes over the internet.",
         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
-    Button(onClick = { c.party.start() }) { Text("Start a watch party with this video") }
+    var name by remember { mutableStateOf(c.party.defaultName()) }
+    NameField(name) { name = it }
+    Button(onClick = { c.party.start(name) }, enabled = name.isNotBlank()) { Text("Start a watch party with this video") }
     Spacer(Modifier.height(4.dp))
-    JoinField(c, onJoined = {})
+    JoinField(c, name, onJoined = {})
 }
 
 @Composable
-private fun JoinField(c: AppController, onJoined: () -> Unit) {
+private fun JoinField(c: AppController, name: String, onJoined: () -> Unit) {
     var code by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
-    fun go() { if (c.party.join(code)) onJoined() else error = "That is not a watch party code (WP-XXXXX-XXXXX-XXXXX-XXXXX)" }
+    fun go() {
+        if (name.isBlank()) { error = "Enter your name first"; return }
+        if (c.party.join(code, name)) onJoined() else error = "That is not a watch party code (WP-XXXXX-XXXXX-XXXXX-XXXXX)"
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             code, { code = it; error = null }, singleLine = true, label = { Text("Invite code") },
             isError = error != null, modifier = Modifier.weight(1f),
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go), keyboardActions = KeyboardActions(onGo = { go() }),
         )
-        OutlinedButton(onClick = { go() }, enabled = code.isNotBlank()) { Text("Join") }
+        OutlinedButton(onClick = { go() }, enabled = code.isNotBlank() && name.isNotBlank()) { Text("Join") }
     }
     error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
 }
@@ -103,6 +130,14 @@ private fun InParty(c: AppController, info: PartyInfo) {
         }
         OutlinedButton(onClick = { PartyManager.copyToClipboard(info.code); c.services.toast("Invite code copied") }) { Text("Copy") }
     }
+    if (ui.isHost) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Let everyone play, pause and seek", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+        androidx.compose.material3.Switch(
+            checked = ui.mode == ControlMode.Everyone,
+            onCheckedChange = { info.session.setMode(if (it) ControlMode.Everyone else ControlMode.HostOnly) },
+        )
+    } else if (!ui.canControl(ui.selfId)) Text("The host controls playback.", style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (!ui.connected) Text("Connecting...", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     if (ui.detached) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("You are out of sync (paused just for you).", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
@@ -182,7 +217,9 @@ fun PartyChip(c: AppController) {
                 Column(Modifier.width(480.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Paste the invite code a friend sent you. The video opens by itself once you are in.",
                         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    JoinField(c, onJoined = { panel = false })
+                    var name by remember { mutableStateOf(c.party.defaultName()) }
+                    NameField(name) { name = it }
+                    JoinField(c, name, onJoined = { panel = false })
                     Text("To start one, open a video and press \"Watch party\" in the player.",
                         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

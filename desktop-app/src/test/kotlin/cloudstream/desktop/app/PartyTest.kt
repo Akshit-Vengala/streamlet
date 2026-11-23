@@ -142,11 +142,11 @@ class PartySessionTest {
     private val key = PartyKey.random()
     private var relay = InMemoryRelay()
 
-    private fun TestScope.peer(name: String, skewMs: Long = 0, config: PartyConfig = PartyConfig(), media: MediaRef? = null): Peer {
+    private fun TestScope.peer(name: String, skewMs: Long = 0, config: PartyConfig = PartyConfig(), media: MediaRef? = null, id: String = name): Peer {
         val clock = { testScheduler.currentTime + skewMs }
         val p = FakePlayer(clock, media)
         val scope: CoroutineScope = backgroundScope
-        val s = PartySession(key, relay.connect(), p, scope, name, selfId = name, now = clock, config = config)
+        val s = PartySession(key, relay.connect(), p, scope, name, selfId = id, now = clock, config = config)
         return Peer(s, p).also { peer -> scope.launch { s.events.collect { peer.events += it } } }
     }
 
@@ -174,6 +174,48 @@ class PartySessionTest {
         host.session.seek(600_000); wait(1000)
         assertNear(600_000, guest.player.positionMs(), 50, "followed the seek")
         assertTrue(guest.events.any { it is PartyEvent.Toast && "jumped to 10:00" in it.text })
+    }
+
+    @Test fun `host sets the speed for everyone without moving the timeline`() = runTest {
+        val host = peer("host", media = media("1"))
+        val guest = peer("guest")
+        host.session.host(); runCurrent(); guest.session.join(); wait(3000)
+        host.session.play(); wait(5000)
+        val before = host.ui.room.positionAt(testScheduler.currentTime)
+        // A dragged slider: only where it stops is sent.
+        host.session.changeSpeed(1.25); wait(100); host.session.changeSpeed(1.5); wait(1000)
+        assertEquals(1.5, host.ui.room.speed)
+        assertEquals(1.5, guest.ui.room.speed)
+        // 400 ms at 1x (until the debounce fires), then 700 ms at 1.5x.
+        assertNear(before + 400 + 1050, host.ui.room.positionAt(testScheduler.currentTime), 100, "rebased, no jump")
+        assertEquals(1, guest.events.count { it is PartyEvent.Toast && "speed to 1.5x" in it.text })
+        wait(10_000)
+        assertNear(host.player.positionMs(), guest.player.positionMs(), 300, "in sync at 1.5x")
+        guest.session.changeSpeed(3.0); wait(1000)
+        assertEquals(1.5, host.ui.room.speed, "only the host changes the speed")
+    }
+
+    @Test fun `members with the same name get distinct names`() = runTest {
+        val host = peer("host", media = media("1"))
+        // Both say they are "Default" (same profile name on two machines).
+        val a = peer("Default", id = "a"); val b = peer("Default", id = "b")
+        host.session.host(); runCurrent()
+        a.session.join(); b.session.join(); wait(3000)
+        val names = host.ui.members.map { it.name }
+        assertEquals(names.size, names.toSet().size, "unique: $names")
+    }
+
+    @Test fun `a leaving host hands the room on, ending closes it for everyone`() = runTest {
+        val host = peer("host", media = media("1"))
+        val g1 = peer("g1"); val g2 = peer("g2")
+        host.session.host(); runCurrent(); g1.session.join(); wait(1500); g2.session.join(); wait(3000)
+        host.session.leave(); wait(2000)
+        assertEquals("g1", g1.ui.hostId); assertTrue(g1.ui.isHost)
+        assertEquals("g1", g2.ui.hostId)
+        assertEquals(listOf("g1", "g2"), g1.ui.members.map { it.id })
+
+        g1.session.leave(endForAll = true); wait(1000)
+        assertTrue(g2.events.any { it == PartyEvent.Ended })
     }
 
     @Test fun `any member can control by default, host only turns it into a nudge`() = runTest {

@@ -218,14 +218,21 @@ private class PlayerSession(
             if (party.isActive && partyTarget != null) party.togglePlay()
             else mpv?.togglePause() ?: run { if (h.player.state.value.playing) h.player.pause() else h.player.play() }
         }
+        ui.ownsPlayback = { party.session?.ui?.value?.let { it.canControl(it.selfId) } ?: true }
         ui.onSeek = { if (party.isActive && partyTarget != null) party.seek(it) else h.player.seek(it.coerceAtLeast(0)) }
         ui.onSeekBy = { d ->
             if (party.isActive && partyTarget != null) party.seekBy(d)
             else mpv?.seekBy(d) ?: h.player.seek((h.player.state.value.positionMs + d).coerceAtLeast(0))
         }
         // The speed the user sets is kept (next episode, restarts); hold-for-2x is temporary and never saved.
-        // In a watch party speed is shared (always 1x for now).
-        ui.onSpeed = { if (party.isActive) c.services.toast("Speed is shared in a watch party") else { ui.speed = it; dp?.setSpeed(it); settings.setPlaybackSpeed(it) } }
+        // In a watch party speed is room state: the host sets it for everyone (not saved as the user's own speed).
+        ui.onSpeed = {
+            when {
+                !party.isActive -> { ui.speed = it; dp?.setSpeed(it); settings.setPlaybackSpeed(it) }
+                partyGuest -> c.services.toast("Only the host can change the speed")
+                else -> { ui.speed = it; party.changeSpeed(it) }
+            }
+        }
         ui.onHoldSpeed = { s -> if (!party.isActive) dp?.setSpeed(s ?: ui.speed) }
         ui.speed = if (party.isActive) 1.0 else settings.playbackSpeed.value
         if (ui.speed != 1.0) dp?.setSpeed(ui.speed)
@@ -447,13 +454,32 @@ private class PlayerSession(
     private suspend fun watchFailures() {
         var gen = -1
         var t0 = 0L; var started = false; var announced = false
+        var noSeek = 0; var noSeekWarned = false
         while (true) {
             delay(500)
             val current = current ?: continue // still on the loading screen
-            if (gen != generation) { gen = generation; t0 = System.currentTimeMillis(); started = false; announced = false }
+            if (gen != generation) { gen = generation; t0 = System.currentTimeMillis(); started = false; announced = false; noSeek = 0; noSeekWarned = false }
             val st = h.player.state.value
             if (st.positionMs > 0) { started = true }
             val age = System.currentTimeMillis() - t0
+            // Watch party: a source mpv cannot seek in can never be kept in sync (every correction seek fails), so try
+            // the next source; if there is none, keep this one and say so.
+            if (party.isActive && st.durationMs > 0 && mpv?.property("seekable") == "no") noSeek++ else noSeek = 0
+            if (noSeek >= 4) {
+                val next = alternatives().firstOrNull { it.playable && it.url !in failed && it.url != current.url }
+                val label = current.name.ifBlank { current.source }
+                if (next != null) {
+                    failed += current.url
+                    ui.failed = failed.toSet()
+                    c.services.toast("$label can't seek, so it can't stay in sync with the party\nTrying ${next.name.ifBlank { next.source }} (${next.qualityLabel})")
+                    switchTo(next)
+                } else if (links()?.loading != true && !noSeekWarned) {
+                    noSeekWarned = true
+                    c.services.toast("$label can't seek: you may fall out of sync with the party")
+                }
+                noSeek = 0
+                continue
+            }
             val why = when {
                 st.error?.startsWith("Playback failed") == true && age > 1000 -> st.error
                 !started && age > settings.fallbackSeconds.value * 1000L -> "no video after ${settings.fallbackSeconds.value}s"

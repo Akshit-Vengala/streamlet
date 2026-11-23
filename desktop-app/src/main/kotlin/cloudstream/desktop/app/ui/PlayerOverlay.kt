@@ -79,6 +79,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectLatest
 import java.awt.Component
 import java.awt.Window
 import javax.swing.SwingUtilities
@@ -168,7 +169,11 @@ class PlayerUi {
     @Volatile private var expectUntil = 0L
 
     /** Play/pause with an immediate icon change; the player's own report follows within a poll or two. */
+    /** false = the press only asks someone else (watch party guest): the icon must not flip. */
+    var ownsPlayback: () -> Boolean = { true }
+
     fun togglePlay() {
+        if (!ownsPlayback()) { onPlayPause(); return }
         val want = !state.playing
         expectPlaying = want; expectUntil = System.currentTimeMillis() + 1000
         state = state.copy(playing = want)
@@ -335,7 +340,8 @@ fun PlayerControls(ui: PlayerUi, toasts: Flow<String>) {
             if (PlayerKeys.keyUp === up) PlayerKeys.keyUp = null
         }
     }
-    LaunchedEffect(Unit) { toasts.collect { snack.showSnackbar(it) } }
+    // Newest message replaces the one showing (a burst must not queue up and keep popping for minutes).
+    LaunchedEffect(Unit) { toasts.collectLatest { snack.showSnackbar(it) } }
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
     // Fade out after 3 s without mouse movement while playing and no sheet open; the pointer hides with them.
     val sheetOpen = dialog != null || ui.extraDialog != null

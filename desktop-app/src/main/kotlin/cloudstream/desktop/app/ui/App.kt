@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.sp
 import cloudstream.desktop.app.AppController
 import cloudstream.desktop.app.vm.Screen
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 
 @Composable
 fun <T> StateFlow<T>.collectAsStateCompat() = collectAsState()
@@ -124,7 +125,8 @@ fun AppRoot(c: AppController, searchFocus: FocusRequester = remember { FocusRequ
             val current = stack.last()
             val snack = remember { SnackbarHostState() }
             // The player shows its own toasts (above its seek bar): not here too, or every message appears twice.
-            LaunchedEffect(Unit) { c.services.toasts.collect { if (c.nav.current !is Screen.Player) snack.showSnackbar(it) } }
+            // collectLatest: a newer message replaces the one showing instead of queueing behind it.
+            LaunchedEffect(Unit) { c.services.toasts.collectLatest { if (c.nav.current !is Screen.Player) snack.showSnackbar(it) } }
             val profile by c.services.profiles.current.collectAsStateCompat()
             var picking by remember { mutableStateOf(c.services.profiles.askOnStart) }
             if (picking) { ProfilePicker(c) { picking = false }; return@Surface }
